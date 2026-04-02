@@ -1,0 +1,62 @@
+{
+  "name": "temporal-workflow-visualizer",
+  "displayName": "Temporal Workflow Visualizer",
+  "description": "Visualize Temporal workflows as interactive Mermaid flowcharts with click-to-navigate",
+  "version": "0.1.0",
+  "publisher": "temporal",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Visualization"],
+  "activationEvents": [
+    "onLanguage:go",
+    "onLanguage:java",
+    "onLanguage:python",
+    "onLanguage:typescript",
+    "onLanguage:php",
+    "onLanguage:csharp"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "temporalVisualizer.showDiagram",
+        "title": "Temporal: Visualize Workflow",
+        "icon": "$(type-hierarchy)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "temporalVisualizer.showDiagram",
+          "when": "resourceExtname =~ /\\.(go|java|py|ts|php|cs)$/",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "temporalVisualizer.showDiagram",
+          "when": "resourceExtname =~ /\\.(go|java|py|ts|php|cs)$/"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "temporalVisualizer.showDiagram",
+          "when": "editorIsOpen"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
