@@ -80,8 +80,8 @@ export class WorkflowDiagramPanel {
   ): string {
     const nodeMetaJson = JSON.stringify(nodeMeta);
     const filePathJson = JSON.stringify(filePath);
-    // Escape backticks in mermaid syntax for JS template literal
-    const mermaidEscaped = mermaidSyntax.replace(/`/g, '\\`').replace(/\$/g, '\\$');
+    // Escape for safe embedding in a <script> JSON assignment
+    const mermaidJson = JSON.stringify(mermaidSyntax);
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -113,177 +113,135 @@ export class WorkflowDiagramPanel {
       background: var(--vscode-editorGroupHeader-tabsBackground);
       flex-shrink: 0;
     }
-
-    #header h2 {
-      font-size: 13px;
-      font-weight: 600;
-      flex: 1;
-    }
-
+    #header h2 { font-size: 13px; font-weight: 600; flex: 1; }
     #lang-badge {
-      font-size: 11px;
-      padding: 2px 8px;
-      border-radius: 10px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+      font-size: 11px; padding: 2px 8px; border-radius: 10px;
+      background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+      text-transform: uppercase; letter-spacing: 0.5px;
     }
-
-    #hint {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-    }
+    #hint { font-size: 11px; color: var(--vscode-descriptionForeground); }
 
     #diagram-container {
-      flex: 1;
-      overflow: auto;
-      padding: 24px;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
+      flex: 1; overflow: auto; padding: 24px;
+      display: flex; align-items: flex-start; justify-content: center;
+    }
+    #diagram { max-width: 100%; }
+    .mermaid { display: flex; justify-content: center; }
+
+    /* Clickable cursor on all flowchart nodes */
+    svg .node { cursor: pointer; }
+    svg .node rect, svg .node circle, svg .node ellipse,
+    svg .node polygon, svg .node path {
+      transition: filter 0.15s ease;
+    }
+    svg .node:hover rect, svg .node:hover circle,
+    svg .node:hover ellipse, svg .node:hover polygon {
+      filter: brightness(1.25) drop-shadow(0 0 4px rgba(0,0,0,0.4));
     }
 
-    #diagram {
-      max-width: 100%;
-    }
-
-    .mermaid {
-      display: flex;
-      justify-content: center;
-    }
-
-    /* Make Mermaid nodes look clickable */
-    .mermaid .node rect,
-    .mermaid .node circle,
-    .mermaid .node ellipse,
-    .mermaid .node polygon,
-    .mermaid .node path {
-      cursor: pointer;
-      transition: filter 0.15s ease, opacity 0.15s ease;
-    }
-    .mermaid .node:hover rect,
-    .mermaid .node:hover circle,
-    .mermaid .node:hover ellipse,
-    .mermaid .node:hover polygon {
-      filter: brightness(1.2);
-      opacity: 0.9;
-    }
-
-    /* Tooltip */
     #tooltip {
       position: fixed;
       padding: 10px 14px;
-      background: var(--vscode-editorHoverWidget-background, #1e1e1e);
+      background: var(--vscode-editorHoverWidget-background, #252526);
       border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
       border-radius: 6px;
       font-size: 12px;
-      font-family: var(--vscode-editor-font-family, monospace);
-      line-height: 1.5;
+      font-family: var(--vscode-editor-font-family, 'Courier New', monospace);
+      line-height: 1.6;
       white-space: pre;
       pointer-events: none;
       display: none;
       z-index: 9999;
       color: var(--vscode-editorHoverWidget-foreground, #d4d4d4);
-      max-width: 360px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      max-width: 380px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     }
 
     #error-msg {
       color: var(--vscode-errorForeground);
-      padding: 24px;
-      text-align: center;
-      display: none;
+      padding: 24px; text-align: center; display: none;
     }
   </style>
 </head>
 <body>
   <div id="header">
-    <h2>⚡ ${workflowName}</h2>
+    <h2>${workflowName}</h2>
     <span id="lang-badge">${language}</span>
-    <span id="hint">Click a node to jump to source · Hover for options</span>
+    <span id="hint">Click node to jump to source &middot; Hover for options</span>
   </div>
-
   <div id="diagram-container">
     <div id="diagram">
       <pre class="mermaid" id="mermaid-pre"></pre>
     </div>
     <div id="error-msg"></div>
   </div>
-
   <div id="tooltip"></div>
+
+  <script>
+    // NODE_META and FILE_PATH injected from extension (plain <script>, not module)
+    const NODE_META = ${nodeMetaJson};
+    const FILE_PATH = ${filePathJson};
+    const DIAGRAM_TEXT = ${mermaidJson};
+
+    // ── Mermaid click callback ──────────────────────────────────────────────
+    // Mermaid's "click X call temporalNodeClick()" calls window.temporalNodeClick
+    // with the node id as the first argument.
+    const vscode = acquireVsCodeApi();
+
+    window.temporalNodeClick = function(nodeId) {
+      const meta = NODE_META[nodeId];
+      if (!meta) { return; }
+      vscode.postMessage({ command: 'navigateTo', line: meta.line, filePath: FILE_PATH });
+    };
+  </script>
 
   <script type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
 
-    const vscode = acquireVsCodeApi();
-    const NODE_META = ${nodeMetaJson};
-    const FILE_PATH = ${filePathJson};
-    const tooltip = document.getElementById('tooltip');
     const mermaidPre = document.getElementById('mermaid-pre');
-    const errorMsg = document.getElementById('error-msg');
+    const errorMsg   = document.getElementById('error-msg');
+    const tooltip    = document.getElementById('tooltip');
 
-    // Detect VS Code theme
     const isDark = document.body.classList.contains('vscode-dark') ||
                    document.body.classList.contains('vscode-high-contrast');
 
     mermaid.initialize({
       startOnLoad: false,
       theme: isDark ? 'dark' : 'default',
-      flowchart: {
-        useMaxWidth: true,
-        htmlLabels: true,
-        curve: 'basis',
-      },
-      securityLevel: 'loose', // required for click handlers
-      fontFamily: getComputedStyle(document.body).fontFamily,
+      flowchart: { useMaxWidth: true, htmlLabels: false, curve: 'basis' },
+      // 'loose' allows the click callbacks defined above to fire
+      securityLevel: 'loose',
     });
 
-    // Set diagram text and render
-    const diagramText = \`${mermaidEscaped}\`;
-    mermaidPre.textContent = diagramText;
+    mermaidPre.textContent = DIAGRAM_TEXT;
 
     try {
       await mermaid.run({ nodes: [mermaidPre] });
     } catch (e) {
       errorMsg.style.display = 'block';
-      errorMsg.textContent = 'Failed to render diagram: ' + e.message;
-      console.error(e);
+      errorMsg.textContent = 'Diagram render error: ' + (e.message || e);
+      console.error('Mermaid error:', e);
     }
 
-    // ── Click-to-line navigation ────────────────────────────────────────────
-    // Mermaid renders click directives as <a href="line:N"> anchors around nodes.
-    // We intercept them before the browser can navigate.
-    document.getElementById('diagram').addEventListener('click', (e) => {
-      const anchor = e.target.closest('a');
-      if (!anchor) { return; }
-      const href = anchor.getAttribute('href') || '';
-      const lineMatch = href.match(/^line:(\\d+)$/);
-      if (lineMatch) {
-        e.preventDefault();
-        e.stopPropagation();
-        vscode.postMessage({
-          command: 'navigateTo',
-          line: parseInt(lineMatch[1], 10),
-          filePath: FILE_PATH,
-        });
-      }
-    });
+    // ── Hover tooltips ──────────────────────────────────────────────────────
+    // After Mermaid renders, each node group gets id="flowchart-{nodeId}-{n}"
+    // We walk up from the hovered element to find that group id, then strip
+    // the trailing "-{digits}" suffix to recover our NODE_META key.
+    //
+    // Critically: node IDs can themselves contain digits and underscores
+    // (e.g. "validate_41"), so we match the LAST "-\d+" only.
 
-    // ── Hover tooltips ────────────────────────────────────────────────────
-    // Mermaid annotates each flowchart node with an id like "flowchart-nodeId-N"
-    // We normalize that back to our NODE_META keys.
-    function extractNodeId(el) {
-      // Walk up to find a .node group with an id
+    function getNodeIdFromElement(el) {
       let cur = el;
       while (cur && cur !== document.body) {
-        const id = cur.getAttribute('id') || '';
-        // Mermaid ids: "flowchart-validate_41-12" → key is "validate_41"
-        const m = id.match(/^flowchart-(.+?)-\\d+$/);
-        if (m) { return m[1]; }
-        // Also check data-id (some versions use this)
-        const dataId = cur.getAttribute('data-id');
-        if (dataId) { return dataId; }
+        const rawId = cur.getAttribute('id') || '';
+        // Mermaid v10/11 pattern: "flowchart-{nodeId}-{index}"
+        // We strip the last "-digits" segment
+        if (rawId.startsWith('flowchart-')) {
+          const inner = rawId.slice('flowchart-'.length); // e.g. "validate_41-0"
+          const nodeId = inner.replace(/-\\d+$/, '');      // → "validate_41"
+          if (NODE_META[nodeId]) { return nodeId; }
+        }
         cur = cur.parentElement;
       }
       return null;
@@ -292,38 +250,37 @@ export class WorkflowDiagramPanel {
     const diagramEl = document.getElementById('diagram');
 
     diagramEl.addEventListener('mouseover', (e) => {
-      const nodeId = extractNodeId(e.target);
-      if (!nodeId) { return; }
+      const nodeId = getNodeIdFromElement(e.target);
+      if (!nodeId) { tooltip.style.display = 'none'; return; }
       const meta = NODE_META[nodeId];
-      if (!meta) { return; }
+      if (!meta) { tooltip.style.display = 'none'; return; }
       tooltip.textContent = meta.tooltip;
       tooltip.style.display = 'block';
-      positionTooltip(e);
+      moveTooltip(e);
     });
 
     diagramEl.addEventListener('mousemove', (e) => {
-      if (tooltip.style.display === 'block') {
-        positionTooltip(e);
-      }
+      if (tooltip.style.display === 'block') { moveTooltip(e); }
     });
 
-    diagramEl.addEventListener('mouseout', (e) => {
-      const related = e.relatedTarget;
-      if (related && (related.closest?.('[id^="flowchart-"]') || related.closest?.('.node'))) {
-        return;
-      }
+    diagramEl.addEventListener('mouseleave', () => {
       tooltip.style.display = 'none';
     });
 
-    function positionTooltip(e) {
-      const tw = tooltip.offsetWidth || 300;
-      const th = tooltip.offsetHeight || 100;
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
+    // Also hide when hovering over non-node SVG elements
+    diagramEl.addEventListener('mouseout', (e) => {
+      if (!getNodeIdFromElement(e.relatedTarget)) {
+        tooltip.style.display = 'none';
+      }
+    });
+
+    function moveTooltip(e) {
+      const tw = tooltip.offsetWidth  || 300;
+      const th = tooltip.offsetHeight || 80;
       let x = e.clientX + 16;
       let y = e.clientY + 16;
-      if (x + tw > vw - 8) { x = e.clientX - tw - 8; }
-      if (y + th > vh - 8) { y = e.clientY - th - 8; }
+      if (x + tw > window.innerWidth  - 8) { x = e.clientX - tw - 8; }
+      if (y + th > window.innerHeight - 8) { y = e.clientY - th - 8; }
       tooltip.style.left = x + 'px';
       tooltip.style.top  = y + 'px';
     }
