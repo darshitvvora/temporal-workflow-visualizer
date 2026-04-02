@@ -2,6 +2,12 @@
 
 A VS Code extension that visualizes [Temporal.io](https://temporal.io) workflows as interactive Mermaid flowcharts — directly inside your editor.
 
+## Demo
+
+<video src="demo_video/demo_video.mp4" controls width="100%"></video>
+
+---
+
 ## Why This Exists
 
 Temporal is code-first. That's a strength — it scales, it's testable, it's version-controlled. But as workflows grow in complexity, understanding the flow becomes harder. Unlike canvas-based DSL or YAML orchestration tools where the diagram _is_ the definition, in Temporal the diagram lives only in your head.
