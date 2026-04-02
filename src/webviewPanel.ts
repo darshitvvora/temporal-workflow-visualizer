@@ -171,34 +171,61 @@ export class WorkflowDiagramPanel {
   </div>
   <div id="diagram-container">
     <div id="diagram">
-      <pre class="mermaid" id="mermaid-pre"></pre>
+      <pre class="mermaid" id="twv-diagram"></pre>
     </div>
     <div id="error-msg"></div>
   </div>
   <div id="tooltip"></div>
 
   <script>
-    // NODE_META and FILE_PATH injected from extension (plain <script>, not module)
-    const NODE_META = ${nodeMetaJson};
-    const FILE_PATH = ${filePathJson};
-    const DIAGRAM_TEXT = ${mermaidJson};
+    // Use var (not const) so these are global and visible inside ES module scripts
+    var NODE_META = ${nodeMetaJson};
+    var FILE_PATH = ${filePathJson};
+    var DIAGRAM_TEXT = ${mermaidJson};
 
-    // ── Mermaid click callback ──────────────────────────────────────────────
-    // Mermaid's "click X call temporalNodeClick()" calls window.temporalNodeClick
-    // with the node id as the first argument.
     const vscode = acquireVsCodeApi();
 
+    // ── Click handler ───────────────────────────────────────────────────────
+    // Mermaid calls window.temporalNodeClick(nodeId) when securityLevel='loose'
+    // and the directive is:  click <nodeId> call temporalNodeClick
+    // (NO parentheses — with "()" Mermaid passes "" instead of nodeId)
     window.temporalNodeClick = function(nodeId) {
       const meta = NODE_META[nodeId];
-      if (!meta) { return; }
+      if (!meta) {
+        console.warn('temporalNodeClick: no meta for', nodeId, Object.keys(NODE_META));
+        return;
+      }
       vscode.postMessage({ command: 'navigateTo', line: meta.line, filePath: FILE_PATH });
+    };
+
+    // ── Hover: extract node ID from any SVG child element ──────────────────
+    // Mermaid v11 sets element id = "{diagramId}-flowchart-{nodeId}-{counter}"
+    // where diagramId = the id of the <pre> element = DIAGRAM_EL_ID.
+    // So we strip the known prefix and suffix to recover our nodeId.
+    window.getNodeIdFromElement = function(el) {
+      const prefix = 'twv-diagram-flowchart-';
+      let cur = el;
+      while (cur && cur !== document.body) {
+        const rawId = cur.getAttribute('id') || '';
+        if (rawId.startsWith(prefix)) {
+          // rawId = "twv-diagram-flowchart-validate_41-0"
+          // strip prefix → "validate_41-0"
+          // strip last -digits → "validate_41"
+          const inner = rawId.slice(prefix.length);
+          const nodeId = inner.replace(/-\\d+$/, '');
+          if (NODE_META[nodeId]) { return nodeId; }
+        }
+        cur = cur.parentElement;
+      }
+      return null;
     };
   </script>
 
   <script type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
 
-    const mermaidPre = document.getElementById('mermaid-pre');
+    // Use the literal id — 'const' in a classic script is not visible inside ES modules
+    const diagramPre = document.getElementById('twv-diagram');
     const errorMsg   = document.getElementById('error-msg');
     const tooltip    = document.getElementById('tooltip');
 
@@ -209,14 +236,13 @@ export class WorkflowDiagramPanel {
       startOnLoad: false,
       theme: isDark ? 'dark' : 'default',
       flowchart: { useMaxWidth: true, htmlLabels: false, curve: 'basis' },
-      // 'loose' allows the click callbacks defined above to fire
-      securityLevel: 'loose',
+      securityLevel: 'loose',   // required for click callbacks to fire
     });
 
-    mermaidPre.textContent = DIAGRAM_TEXT;
+    diagramPre.textContent = DIAGRAM_TEXT;
 
     try {
-      await mermaid.run({ nodes: [mermaidPre] });
+      await mermaid.run({ nodes: [diagramPre] });
     } catch (e) {
       errorMsg.style.display = 'block';
       errorMsg.textContent = 'Diagram render error: ' + (e.message || e);
@@ -224,33 +250,10 @@ export class WorkflowDiagramPanel {
     }
 
     // ── Hover tooltips ──────────────────────────────────────────────────────
-    // After Mermaid renders, each node group gets id="flowchart-{nodeId}-{n}"
-    // We walk up from the hovered element to find that group id, then strip
-    // the trailing "-{digits}" suffix to recover our NODE_META key.
-    //
-    // Critically: node IDs can themselves contain digits and underscores
-    // (e.g. "validate_41"), so we match the LAST "-\d+" only.
-
-    function getNodeIdFromElement(el) {
-      let cur = el;
-      while (cur && cur !== document.body) {
-        const rawId = cur.getAttribute('id') || '';
-        // Mermaid v10/11 pattern: "flowchart-{nodeId}-{index}"
-        // We strip the last "-digits" segment
-        if (rawId.startsWith('flowchart-')) {
-          const inner = rawId.slice('flowchart-'.length); // e.g. "validate_41-0"
-          const nodeId = inner.replace(/-\\d+$/, '');      // → "validate_41"
-          if (NODE_META[nodeId]) { return nodeId; }
-        }
-        cur = cur.parentElement;
-      }
-      return null;
-    }
-
     const diagramEl = document.getElementById('diagram');
 
     diagramEl.addEventListener('mouseover', (e) => {
-      const nodeId = getNodeIdFromElement(e.target);
+      const nodeId = window.getNodeIdFromElement(e.target);
       if (!nodeId) { tooltip.style.display = 'none'; return; }
       const meta = NODE_META[nodeId];
       if (!meta) { tooltip.style.display = 'none'; return; }
@@ -263,13 +266,10 @@ export class WorkflowDiagramPanel {
       if (tooltip.style.display === 'block') { moveTooltip(e); }
     });
 
-    diagramEl.addEventListener('mouseleave', () => {
-      tooltip.style.display = 'none';
-    });
+    diagramEl.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
 
-    // Also hide when hovering over non-node SVG elements
     diagramEl.addEventListener('mouseout', (e) => {
-      if (!getNodeIdFromElement(e.relatedTarget)) {
+      if (!window.getNodeIdFromElement(e.relatedTarget)) {
         tooltip.style.display = 'none';
       }
     });

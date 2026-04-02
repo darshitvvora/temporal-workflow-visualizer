@@ -10,7 +10,9 @@ export class GoParser extends BaseParser {
     const defaultOptions = this.parseActivityOptions();
     const nodes: WorkflowNode[] = [];
 
-    // ExecuteActivity with if-err-return error branch detection
+    // ── Activities ──────────────────────────────────────────────────────────
+
+    // ExecuteActivity
     this.findAllLines(/workflow\.ExecuteActivity\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/).forEach(({ line, match }) => {
       const errorBranch = this.detectGoErrorBranch(line);
       nodes.push({
@@ -23,32 +25,124 @@ export class GoParser extends BaseParser {
       });
     });
 
-    // Query handlers
+    // ExecuteLocalActivity
+    this.findAllLines(/workflow\.ExecuteLocalActivity\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/).forEach(({ line, match }) => {
+      const errorBranch = this.detectGoErrorBranch(line);
+      nodes.push({
+        id: this.toId('local_' + match[1], line),
+        label: match[1] + ' (local)',
+        kind: 'activity',
+        line,
+        options: defaultOptions ? { ...defaultOptions } : undefined,
+        errorBranches: errorBranch ? [errorBranch] : undefined,
+      });
+    });
+
+    // ── Query handlers ────────────────────────────────────────────────────
+
     this.findAllLines(/workflow\.SetQueryHandler\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('query_' + match[1]), label: match[1] + ' (query)', kind: 'query', line });
+    });
+    this.findAllLines(/workflow\.SetQueryHandlerWithOptions\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
       nodes.push({ id: this.toId('query_' + match[1]), label: match[1] + ' (query)', kind: 'query', line });
     });
     this.findAllLines(/SetQueryHandlerFor(\w+)\s*\(/).forEach(({ line, match }) => {
       nodes.push({ id: this.toId('query_' + match[1]), label: match[1] + ' (query)', kind: 'query', line });
     });
 
-    // Signal channels
+    // ── Signal channels ────────────────────────────────────────────────────
+
     this.findAllLines(/workflow\.GetSignalChannel\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
       nodes.push({ id: this.toId('signal_' + match[1]), label: match[1] + ' (signal)', kind: 'signal', line });
     });
+    this.findAllLines(/workflow\.GetSignalChannelWithOptions\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('signal_' + match[1]), label: match[1] + ' (signal)', kind: 'signal', line });
+    });
 
-    // SideEffect
+    // SignalExternalWorkflow
+    this.findAllLines(/workflow\.SignalExternalWorkflow\s*\(\s*ctx,/).forEach(({ line }) => {
+      nodes.push({ id: `signal_ext_${line}`, label: 'SignalExternalWorkflow', kind: 'signal', line });
+    });
+
+    // ── Update handlers ────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.SetUpdateHandler\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('update_' + match[1]), label: match[1] + ' (update)', kind: 'signal', line });
+    });
+    this.findAllLines(/workflow\.SetUpdateHandlerWithOptions\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('update_' + match[1]), label: match[1] + ' (update)', kind: 'signal', line });
+    });
+
+    // ── SideEffect / MutableSideEffect ────────────────────────────────────
+
     this.findAllLines(/workflow\.SideEffect\s*\(/).forEach(({ line }) => {
       nodes.push({ id: `side_effect_${line}`, label: 'SideEffect', kind: 'sideEffect', line });
     });
+    this.findAllLines(/workflow\.MutableSideEffect\s*\(\s*ctx,\s*"(\w+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('mutable_se_' + match[1], line), label: 'MutableSideEffect: ' + match[1], kind: 'sideEffect', line });
+    });
 
-    // Timers
+    // ── Timers ─────────────────────────────────────────────────────────────
+
     this.findAllLines(/workflow\.Sleep\s*\(/).forEach(({ line }) => {
       nodes.push({ id: `sleep_${line}`, label: 'Sleep', kind: 'timer', line });
     });
+    this.findAllLines(/workflow\.NewTimer\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `timer_${line}`, label: 'NewTimer', kind: 'timer', line });
+    });
 
-    // Child workflows
+    // ── Conditions / Await ─────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.Await\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `await_${line}`, label: 'Await (condition)', kind: 'signal', line });
+    });
+    this.findAllLines(/workflow\.AwaitWithTimeout\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `await_timeout_${line}`, label: 'AwaitWithTimeout', kind: 'signal', line });
+    });
+
+    // ── Versioning ─────────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.GetVersion\s*\(\s*ctx,\s*"([^"]+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('version_' + match[1], line), label: 'GetVersion: ' + match[1], kind: 'sideEffect', line });
+    });
+
+    // ── Child workflows ────────────────────────────────────────────────────
+
     this.findAllLines(/workflow\.ExecuteChildWorkflow\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/).forEach(({ line, match }) => {
       nodes.push({ id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow', line });
+    });
+
+    // ── Continue-As-New ────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.NewContinueAsNewError\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `can_${line}`, label: 'ContinueAsNew', kind: 'sideEffect', line });
+    });
+
+    // ── Memo & Search Attributes ───────────────────────────────────────────
+
+    this.findAllLines(/workflow\.UpsertMemo\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `upsert_memo_${line}`, label: 'UpsertMemo', kind: 'sideEffect', line });
+    });
+    this.findAllLines(/workflow\.UpsertTypedSearchAttributes\s*\(|workflow\.UpsertSearchAttributes\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `upsert_sa_${line}`, label: 'UpsertSearchAttributes', kind: 'sideEffect', line });
+    });
+
+    // ── Sessions ───────────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.CreateSession\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `session_${line}`, label: 'CreateSession', kind: 'sideEffect', line });
+    });
+
+    // ── Goroutines (workflow.Go) ───────────────────────────────────────────
+
+    this.findAllLines(/workflow\.Go\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `goroutine_${line}`, label: 'workflow.Go (goroutine)', kind: 'sideEffect', line });
+    });
+
+    // ── Nexus ──────────────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.NewNexusClient\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `nexus_${line}`, label: 'NewNexusClient', kind: 'childWorkflow', line });
     });
 
     nodes.sort((a, b) => a.line - b.line);
@@ -62,18 +156,15 @@ export class GoParser extends BaseParser {
    *       // optional compensation activities
    *       return nil, err
    *   }
-   * We detect the if-err block and any compensation activities inside it.
    */
   private detectGoErrorBranch(activityLine: number): ErrorBranch | null {
-    // Look for "if err != nil {" within the next ~5 lines after the activity call
     for (let i = activityLine; i < Math.min(this.lines.length, activityLine + 6); i++) {
       const l = this.lines[i];
       if (/if\s+err\s*!=\s*nil\s*\{/.test(l)) {
-        const errBranchLine = i + 1; // 1-based
+        const errBranchLine = i + 1;
         const block = this.extractBlock(errBranchLine, 20);
         const branchNodes: WorkflowNode[] = [];
 
-        // Any compensation activities inside the if block?
         const blockLines = block.split('\n');
         for (let j = 0; j < blockLines.length; j++) {
           const m = blockLines[j].match(/workflow\.ExecuteActivity\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/);
@@ -86,7 +177,6 @@ export class GoParser extends BaseParser {
               line: compLine,
             });
           }
-          // return nil, err pattern
           if (/return\s+nil,\s*err/.test(blockLines[j])) {
             const retLine = errBranchLine + j;
             branchNodes.push({
@@ -98,11 +188,7 @@ export class GoParser extends BaseParser {
           }
         }
 
-        return {
-          nodes: branchNodes,
-          edgeLabel: 'on error',
-          line: errBranchLine,
-        };
+        return { nodes: branchNodes, edgeLabel: 'on error', line: errBranchLine };
       }
     }
     return null;

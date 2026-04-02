@@ -4,26 +4,17 @@ import { WorkflowModel, WorkflowNode, ActivityOptions, RetryPolicy, ErrorBranch 
 export class PythonParser extends BaseParser {
   parse(): WorkflowModel | null {
     // @workflow.defn  or  @workflow.defn(...)  followed by class XxxWorkflow:
-    // The [\s\S]*? allows for arguments like (dynamic=True, name="foo")
     const classMatch = this.source.match(/@workflow\.defn(?:\([^)]*\))?\s*\nclass\s+(\w+)\s*[:(]/);
     if (!classMatch) { return null; }
     const name = classMatch[1];
 
     const nodes: WorkflowNode[] = [];
 
-    // Collect execute_activity calls with their error branches
+    // Collect execute_activity / start_activity calls with their error branches
     const activityNodes = this.parseActivityCalls();
     nodes.push(...activityNodes);
 
-    // @workflow.query decorated methods
-    this.findAllLines(/@workflow\.query(?:\([^)]*\))?/).forEach(({ line, match }) => {
-      const rawLine = this.lines[line - 1];
-      const nameMatch = rawLine.match(/name=["'](\w+)["']/);
-      const qName = nameMatch ? nameMatch[1] : this.getNextMethodName(line);
-      if (qName) {
-        nodes.push({ id: this.toId('query_' + qName), label: qName + ' (query)', kind: 'query', line });
-      }
-    });
+    // ── Signal handlers ──────────────────────────────────────────────────
 
     // @workflow.signal decorated methods
     this.findAllLines(/@workflow\.signal(?:\([^)]*\))?/).forEach(({ line }) => {
@@ -34,25 +25,118 @@ export class PythonParser extends BaseParser {
         nodes.push({ id: this.toId('signal_' + sName), label: sName + ' (signal)', kind: 'signal', line });
       }
     });
+    // Dynamic signal handler registration
+    this.findAllLines(/workflow\.set_signal_handler\s*\(\s*["'](\w+)["']/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('signal_dyn_' + match[1], line), label: match[1] + ' (signal, dynamic)', kind: 'signal', line });
+    });
+    this.findAllLines(/workflow\.set_dynamic_signal_handler\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `signal_dynamic_${line}`, label: 'dynamic signal handler', kind: 'signal', line });
+    });
+
+    // ── Query handlers ────────────────────────────────────────────────────
+
+    // @workflow.query decorated methods
+    this.findAllLines(/@workflow\.query(?:\([^)]*\))?/).forEach(({ line }) => {
+      const rawLine = this.lines[line - 1];
+      const nameMatch = rawLine.match(/name=["'](\w+)["']/);
+      const qName = nameMatch ? nameMatch[1] : this.getNextMethodName(line);
+      if (qName) {
+        nodes.push({ id: this.toId('query_' + qName), label: qName + ' (query)', kind: 'query', line });
+      }
+    });
+    this.findAllLines(/workflow\.set_query_handler\s*\(\s*["'](\w+)["']/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('query_dyn_' + match[1], line), label: match[1] + ' (query, dynamic)', kind: 'query', line });
+    });
+
+    // ── Update handlers ───────────────────────────────────────────────────
+
+    this.findAllLines(/@workflow\.update(?:\([^)]*\))?/).forEach(({ line }) => {
+      const rawLine = this.lines[line - 1];
+      const nameMatch = rawLine.match(/name=["'](\w+)["']/);
+      const uName = nameMatch ? nameMatch[1] : this.getNextMethodName(line);
+      if (uName) {
+        nodes.push({ id: this.toId('update_' + uName), label: uName + ' (update)', kind: 'signal', line });
+      }
+    });
+    this.findAllLines(/workflow\.set_update_handler\s*\(\s*["'](\w+)["']/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('update_dyn_' + match[1], line), label: match[1] + ' (update, dynamic)', kind: 'signal', line });
+    });
+    this.findAllLines(/workflow\.set_dynamic_update_handler\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `update_dynamic_${line}`, label: 'dynamic update handler', kind: 'signal', line });
+    });
+
+    // ── Conditions / waiting ──────────────────────────────────────────────
 
     // wait_condition (approval gate / human-in-loop)
     this.findAllLines(/await\s+workflow\.wait_condition\s*\(/).forEach(({ line }) => {
       nodes.push({ id: `wait_cond_${line}`, label: 'wait_condition', kind: 'signal', line });
     });
 
-    // asyncio.sleep / workflow.sleep
+    // asyncio.gather / workflow.wait — parallel waiting
+    this.findAllLines(/await\s+asyncio\.gather\s*\(|await\s+workflow\.wait\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `wait_gather_${line}`, label: 'wait (parallel)', kind: 'sideEffect', line });
+    });
+
+    // ── Timers ─────────────────────────────────────────────────────────────
+
     this.findAllLines(/await\s+asyncio\.sleep\s*\(|await\s+workflow\.sleep\s*\(/).forEach(({ line }) => {
       nodes.push({ id: `sleep_${line}`, label: 'sleep', kind: 'timer', line });
     });
 
-    // uuid4 idempotency key
+    // ── Versioning / Patching ─────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.patched\s*\(\s*["']([^'"]+)["']/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('patch_' + match[1], line), label: 'patched: ' + match[1], kind: 'sideEffect', line });
+    });
+    this.findAllLines(/workflow\.deprecate_patch\s*\(\s*["']([^'"]+)["']/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('deprecate_patch_' + match[1], line), label: 'deprecate_patch: ' + match[1], kind: 'sideEffect', line });
+    });
+
+    // ── Side effects / randomness / UUIDs ─────────────────────────────────
+
     this.findAllLines(/workflow\.uuid4\s*\(\s*\)/).forEach(({ line }) => {
       nodes.push({ id: `uuid4_${line}`, label: 'uuid4 (idempotencyKey)', kind: 'sideEffect', line });
     });
+    this.findAllLines(/workflow\.random\s*\(\s*\)/).forEach(({ line }) => {
+      nodes.push({ id: `random_${line}`, label: 'random (deterministic)', kind: 'sideEffect', line });
+    });
 
-    // execute_child_workflow
+    // ── Memo & Search Attributes ──────────────────────────────────────────
+
+    this.findAllLines(/workflow\.upsert_memo\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `upsert_memo_${line}`, label: 'upsert_memo', kind: 'sideEffect', line });
+    });
+    this.findAllLines(/workflow\.upsert_search_attributes\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `upsert_sa_${line}`, label: 'upsert_search_attributes', kind: 'sideEffect', line });
+    });
+
+    // ── Continue-As-New ────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.continue_as_new\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `can_${line}`, label: 'continue_as_new', kind: 'sideEffect', line });
+    });
+
+    // ── External workflow handles ──────────────────────────────────────────
+
+    this.findAllLines(/workflow\.get_external_workflow_handle\s*\(|workflow\.get_external_workflow_handle_for\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `ext_wf_${line}`, label: 'get_external_workflow_handle', kind: 'childWorkflow', line });
+    });
+
+    // ── Child workflows ────────────────────────────────────────────────────
+
+    // execute_child_workflow (awaited)
     this.findAllLines(/await\s+workflow\.execute_child_workflow\s*\(\s*(?:\w+\.)?(\w+)/).forEach(({ line, match }) => {
       nodes.push({ id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow', line });
+    });
+    // start_child_workflow (fire-and-forget handle)
+    this.findAllLines(/await\s+workflow\.start_child_workflow\s*\(\s*(?:\w+\.)?(\w+)/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('child_started_' + match[1], line), label: match[1] + ' (child, started)', kind: 'childWorkflow', line });
+    });
+
+    // ── Nexus ──────────────────────────────────────────────────────────────
+
+    this.findAllLines(/workflow\.create_nexus_client\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `nexus_${line}`, label: 'create_nexus_client', kind: 'childWorkflow', line });
     });
 
     nodes.sort((a, b) => a.line - b.line);
@@ -60,17 +144,15 @@ export class PythonParser extends BaseParser {
   }
 
   /**
-   * Parses all execute_activity calls and groups those inside try blocks
-   * so that except-clause activities become error branches.
+   * Parses all execute_activity / start_activity calls and groups those inside
+   * try blocks so that except-clause activities become error branches.
    */
   private parseActivityCalls(): WorkflowNode[] {
     const result: WorkflowNode[] = [];
 
     const tryBlocks = this.findTryExceptBlocks();
 
-    // Map lines in try-body → their TryBlock (for attaching error branches)
     const lineToTryBlock = new Map<number, TryBlock>();
-    // Set of lines inside except bodies (should NOT be emitted as top-level nodes)
     const exceptBodyLines = new Set<number>();
     for (const tb of tryBlocks) {
       for (let l = tb.tryStart; l <= tb.tryEnd; l++) {
@@ -83,20 +165,25 @@ export class PythonParser extends BaseParser {
       }
     }
 
-    // Collect all execute_activity occurrences
-    this.findAllLines(/await\s+workflow\.execute_(?:local_)?activity\s*\(\s*(?:\w+\.)?(\w+)/).forEach(({ line, match }) => {
-      // Skip activities that live inside an except block — they're already captured
-      // as compensation nodes inside buildErrorBranches
+    // Matches execute_activity, execute_local_activity, start_activity, start_local_activity,
+    // plus _method and _class variants
+    const actPat = /await\s+workflow\.(execute|start)_(?:local_)?activity(?:_method|_class)?\s*\(\s*(?:\w+\.)?(\w+)/;
+
+    this.findAllLines(actPat).forEach(({ line, match }) => {
       if (exceptBodyLines.has(line)) { return; }
 
-      const isLocal = /execute_local_activity/.test(this.lines[line - 1]);
-      const actName = match[1] + (isLocal ? ' (local)' : '');
-      const actId = this.toId(match[1] + (isLocal ? '_local' : ''), line);
+      const isStarted = match[1] === 'start';
+      const lineText = this.lines[line - 1];
+      const isLocal = /(?:execute|start)_local_activity/.test(lineText);
+      const rawName = match[2];
+      const suffix = (isLocal ? ' (local)' : '') + (isStarted ? ' (started)' : '');
+      const actName = rawName + suffix;
+      const actId = this.toId(rawName + (isLocal ? '_local' : '') + (isStarted ? '_started' : ''), line);
       const opts = this.parseActivityCallOptions(line);
 
       const tb = lineToTryBlock.get(line);
       if (tb) {
-        const errorBranches = this.buildErrorBranches(tb, line);
+        const errorBranches = this.buildErrorBranches(tb);
         result.push({ id: actId, label: actName, kind: 'activity', line, options: opts, errorBranches });
       } else {
         result.push({ id: actId, label: actName, kind: 'activity', line, options: opts });
@@ -106,14 +193,13 @@ export class PythonParser extends BaseParser {
     return result;
   }
 
-  private buildErrorBranches(tb: { tryEnd: number; exceptBlocks: ExceptBlock[] }, _triggerLine: number): ErrorBranch[] {
+  private buildErrorBranches(tb: { tryEnd: number; exceptBlocks: ExceptBlock[] }): ErrorBranch[] {
     const branches: ErrorBranch[] = [];
     for (const except of tb.exceptBlocks) {
       const exceptNodes: WorkflowNode[] = [];
 
-      // Find any execute_activity calls inside the except block
       for (let l = except.start; l <= except.end && l <= this.lines.length; l++) {
-        const m = this.lines[l - 1].match(/await\s+workflow\.execute_(?:local_)?activity\s*\(\s*(?:\w+\.)?(\w+)/);
+        const m = this.lines[l - 1].match(/await\s+workflow\.(?:execute|start)_(?:local_)?activity(?:_method|_class)?\s*\(\s*(?:\w+\.)?(\w+)/);
         if (m) {
           const opts = this.parseActivityCallOptions(l);
           exceptNodes.push({
@@ -145,60 +231,67 @@ export class PythonParser extends BaseParser {
     return branches;
   }
 
-  // ── try/except block detection ───────────────────────────────────────────
+  // ── try/except block detection (indent-based for Python) ─────────────────
 
   private findTryExceptBlocks(): TryBlock[] {
     const blocks: TryBlock[] = [];
 
     for (let i = 0; i < this.lines.length; i++) {
-      const line = this.lines[i];
-      const tryMatch = line.match(/^(\s*)try\s*:/);
+      const tryMatch = this.lines[i].match(/^(\s*)try\s*:/);
       if (!tryMatch) { continue; }
 
       const baseIndent = tryMatch[1].length;
-      const tryStart = i + 1; // 1-based
+      // tryStart: 1-based line number of the first try-body line
+      const tryStart = i + 2; // i is 0-based index of "try:", body starts at i+1 (0-based) = i+2 (1-based)
 
-      // Find where the try body ends (first line with same or less indent that isn't blank)
-      let tryEnd = tryStart;
+      // Find the 0-based index of the first except/else/finally at the same indent level
+      let exceptLineIdx = -1;
       for (let j = i + 1; j < this.lines.length; j++) {
         const l = this.lines[j];
         if (l.trim() === '') { continue; }
-        const indent = l.match(/^(\s*)/)?.[1].length ?? 0;
+        const indent = (l.match(/^(\s*)/)?.[1].length) ?? 0;
         if (indent <= baseIndent && /^\s*(except|else|finally)/.test(l)) {
-          tryEnd = j; // 1-based: j is index, but it's the except line itself
+          exceptLineIdx = j;
           break;
         }
-        tryEnd = j + 1;
       }
+      if (exceptLineIdx < 0) { continue; }
 
-      // Collect except blocks
+      // tryEnd: 1-based line number of the last line of the try body
+      // Last try-body line is at 0-based (exceptLineIdx - 1) = 1-based exceptLineIdx
+      const tryEnd = exceptLineIdx;
+
+      // Collect except blocks; j tracks 0-based index of the except line
       const exceptBlocks: ExceptBlock[] = [];
-      let j = tryEnd; // index of first except line
+      let j = exceptLineIdx;
       while (j < this.lines.length) {
         const l = this.lines[j];
         if (l.trim() === '') { j++; continue; }
-        const indent = l.match(/^(\s*)/)?.[1].length ?? 0;
+        const indent = (l.match(/^(\s*)/)?.[1].length) ?? 0;
         if (indent < baseIndent) { break; }
 
         const exceptMatch = l.match(/^\s*except\s*(?:(\w+(?:\.\w+)?)\s*(?:as\s+\w+)?)?\s*:/);
         if (!exceptMatch) { break; }
 
         const errorType = exceptMatch[1] || '';
-        const exceptStart = j + 1; // 1-based
+        // except body starts at the next line after the except: declaration
+        const exceptStart = j + 2; // 0-based j+1 → 1-based j+2
         let exceptEnd = exceptStart;
 
         for (let k = j + 1; k < this.lines.length; k++) {
           const el = this.lines[k];
           if (el.trim() === '') { continue; }
-          const eindent = el.match(/^(\s*)/)?.[1].length ?? 0;
+          const eindent = (el.match(/^(\s*)/)?.[1].length) ?? 0;
           if (eindent <= baseIndent && /^\s*(except|else|finally|[^\s])/.test(el)) {
-            exceptEnd = k; // exclusive
+            // Last except-body line is 0-based k-1 = 1-based k
+            exceptEnd = k;
             break;
           }
-          exceptEnd = k + 1;
+          exceptEnd = k + 1; // 0-based k → 1-based k+1
         }
 
         exceptBlocks.push({ start: exceptStart, end: exceptEnd, errorType });
+        // exceptEnd is 1-based last line of except body; as 0-based index of next line = exceptEnd
         j = exceptEnd;
       }
 
@@ -225,14 +318,14 @@ export class PythonParser extends BaseParser {
     const block = callText.join('\n');
     const opts: ActivityOptions = {};
 
-    const stc = block.match(/start_to_close_timeout\s*=\s*timedelta\s*\(seconds\s*=\s*([\d.]+)\)/);
-    if (stc) { opts.startToCloseTimeout = stc[1] + 's'; }
+    const stc = block.match(/start_to_close_timeout\s*=\s*timedelta\s*\(([^)]+)\)/);
+    if (stc) { opts.startToCloseTimeout = this.parseTdelta(stc[1]); }
 
-    const sc = block.match(/schedule_to_close_timeout\s*=\s*timedelta\s*\(seconds\s*=\s*([\d.]+)\)/);
-    if (sc) { opts.scheduleToCloseTimeout = sc[1] + 's'; }
+    const sc = block.match(/schedule_to_close_timeout\s*=\s*timedelta\s*\(([^)]+)\)/);
+    if (sc) { opts.scheduleToCloseTimeout = this.parseTdelta(sc[1]); }
 
-    const hb = block.match(/heartbeat_timeout\s*=\s*timedelta\s*\(seconds\s*=\s*([\d.]+)\)/);
-    if (hb) { opts.heartbeatTimeout = hb[1] + 's'; }
+    const hb = block.match(/heartbeat_timeout\s*=\s*timedelta\s*\(([^)]+)\)/);
+    if (hb) { opts.heartbeatTimeout = this.parseTdelta(hb[1]); }
 
     const rpRef = block.match(/retry_policy\s*=\s*([\w.]+)/);
     if (rpRef) {
@@ -243,6 +336,18 @@ export class PythonParser extends BaseParser {
     return Object.keys(opts).length > 0 ? opts : undefined;
   }
 
+  /** Parse a timedelta(...) argument string like "hours=1, minutes=30, seconds=5" → "1h 30m 5s" */
+  private parseTdelta(args: string): string {
+    const h = args.match(/hours\s*=\s*([\d.]+)/);
+    const m = args.match(/minutes\s*=\s*([\d.]+)/);
+    const s = args.match(/seconds\s*=\s*([\d.]+)/);
+    const parts: string[] = [];
+    if (h) { parts.push(h[1] + 'h'); }
+    if (m) { parts.push(m[1] + 'm'); }
+    if (s) { parts.push(s[1] + 's'); }
+    return parts.length > 0 ? parts.join(' ') : args.trim();
+  }
+
   private resolveRetryPolicy(ref: string): RetryPolicy | undefined {
     const escaped = ref.replace(/\./g, '\\.').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
     const pattern = new RegExp(`${escaped}\\s*=\\s*RetryPolicy\\s*\\(([\\s\\S]*?)\\)`, 'm');
@@ -250,12 +355,12 @@ export class PythonParser extends BaseParser {
     if (!m) { return undefined; }
     const block = m[1];
     const rp: RetryPolicy = {};
-    const ii = block.match(/initial_interval\s*=\s*timedelta\s*\(seconds\s*=\s*([\d.]+)\)/);
-    if (ii) { rp.initialInterval = ii[1] + 's'; }
+    const ii = block.match(/initial_interval\s*=\s*timedelta\s*\(([^)]+)\)/);
+    if (ii) { rp.initialInterval = this.parseTdelta(ii[1]); }
     const bc = block.match(/backoff_coefficient\s*=\s*([\d.]+)/);
     if (bc) { rp.backoffCoefficient = parseFloat(bc[1]); }
-    const mi = block.match(/maximum_interval\s*=\s*timedelta\s*\(seconds\s*=\s*([\d.]+)\)/);
-    if (mi) { rp.maximumInterval = mi[1] + 's'; }
+    const mi = block.match(/maximum_interval\s*=\s*timedelta\s*\(([^)]+)\)/);
+    if (mi) { rp.maximumInterval = this.parseTdelta(mi[1]); }
     const ma = block.match(/maximum_attempts\s*=\s*(\d+)/);
     if (ma) { rp.maximumAttempts = parseInt(ma[1], 10); }
     return Object.keys(rp).length > 0 ? rp : undefined;

@@ -33,7 +33,8 @@ export function generateMermaid(model: WorkflowModel): string {
   out.push('');
 
   for (const id of clickIds) {
-    out.push(`  click ${id} call temporalNodeClick()`);
+    // Mermaid v11: "click nodeId callbackName" (no 'call' keyword)
+    out.push(`  click ${id} temporalNodeClick`);
   }
 
   return out.join('\n');
@@ -70,7 +71,7 @@ function emitNode(ctx: EmitCtx, node: WorkflowNode, prev: string): string {
   // The happy-path continues from ok_pass.
 
   const decId = `${id}_dec_${ctx.counter++}`;
-  out.push(`  ${decId}{{"ok?"}}:::startEnd`);
+  out.push(`  ${decId}{"ok?"}:::startEnd`);
   out.push(`  ${id} --> ${decId}`);
 
   // Each error branch goes off to the side

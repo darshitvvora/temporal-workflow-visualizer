@@ -3,11 +3,13 @@
   "displayName": "Temporal Workflow Visualizer",
   "description": "Visualize Temporal workflows as interactive Mermaid flowcharts with click-to-navigate",
   "version": "0.1.0",
-  "publisher": "temporal",
+  "publisher": "Darshit Vora",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Visualization"],
+  "categories": [
+    "Visualization"
+  ],
   "activationEvents": [
     "onLanguage:go",
     "onLanguage:java",
@@ -54,9 +56,12 @@
     "package": "vsce package"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
     "@types/node": "^20.0.0",
-    "typescript": "^5.3.0",
-    "@vscode/vsce": "^2.22.0"
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "mermaid": "^11.14.0"
   }
 }

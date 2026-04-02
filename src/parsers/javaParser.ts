@@ -1,105 +1,169 @@
 import { BaseParser } from './baseParser';
-import { WorkflowModel, WorkflowNode, ActivityOptions, RetryPolicy } from '../types';
+import { WorkflowModel, ActivityOptions, RetryPolicy } from '../types';
+
+// try {      } catch (SomeException e) {    or   } catch (A | B e) {
+const JAVA_TRY   = /\btry\s*\{/;
+const JAVA_CATCH = /\}\s*catch\s*\((?:[\w|]+\s+(\w+)|(\w+))\s*\)/;
+const JAVA_THROW = /throw\s+new\s+(\w+(?:Exception|Error)?)\s*\(/;
 
 export class JavaParser extends BaseParser {
   parse(): WorkflowModel | null {
-    // Detect: class XxxImpl implements XxxWorkflow  OR  class Xxx (with @WorkflowInterface)
     const classMatch = this.source.match(/public\s+class\s+(\w+)\s+implements\s+\w*[Ww]orkflow/);
     if (!classMatch) { return null; }
     const name = classMatch[1].replace(/Impl$/, '');
 
     const defaultOptions = this.parseActivityOptions();
-    const nodes: WorkflowNode[] = [];
-
-    // Activity stub variable name(s): Workflow.newActivityStub(...)
-    // Then calls are: stubVar.methodName(...)
     const stubVars = this.findActivityStubVars();
 
+    const tryCatchBlocks = this.findTryCatchBlocks(JAVA_TRY, JAVA_CATCH);
+    const catchLines  = this.buildCatchLineSet(tryCatchBlocks);
+    const tryLineMap  = this.buildTryLineMap(tryCatchBlocks);
+
+    // Activity pattern inside catch: stubVar.methodName(
+    const actPat = new RegExp(`(?:${stubVars.join('|')})\\.(\\w+)\\s*\\(`);
+
+    const nodes: import('../types').WorkflowNode[] = [];
+
+    // ── Activity calls via stubs ───────────────────────────────────────────
+
     for (const stubVar of stubVars) {
-      // activities.validate(...), activities.withdraw(...) etc
       this.findAllLines(new RegExp(`\\b${stubVar}\\.(\\w+)\\s*\\(`)).forEach(({ line, match }) => {
-        // Skip non-activity method names like getters
-        const methodName = match[1];
+        if (catchLines.has(line)) { return; }
+        const methodName = match[1].replace(/Async$/, '');
+        const tb = tryLineMap.get(line);
+        const errorBranches = tb
+          ? this.buildErrorBranchesFromCatch(tb, actPat, JAVA_THROW)
+          : undefined;
         nodes.push({
           id: this.toId(methodName, line),
           label: methodName,
-          kind: 'activity',
+          kind: 'activity' as const,
           line,
           options: defaultOptions ? { ...defaultOptions } : undefined,
+          errorBranches: errorBranches?.length ? errorBranches : undefined,
         });
       });
     }
 
-    // Workflow.sleep
+    // ── Timers ─────────────────────────────────────────────────────────────
+
     this.findAllLines(/Workflow\.sleep\s*\(/).forEach(({ line }) => {
-      nodes.push({ id: `sleep_${line}`, label: 'sleep', kind: 'timer', line });
+      if (!catchLines.has(line)) {
+        nodes.push({ id: `sleep_${line}`, label: 'sleep', kind: 'timer' as const, line });
+      }
     });
 
-    // @WorkflowQuery methods
+    // ── Conditions ─────────────────────────────────────────────────────────
+
+    this.findAllLines(/Workflow\.await\s*\(/).forEach(({ line }) => {
+      if (!catchLines.has(line)) {
+        nodes.push({ id: `await_cond_${line}`, label: 'Workflow.await (condition)', kind: 'signal' as const, line });
+      }
+    });
+
+    // ── Query handlers ─────────────────────────────────────────────────────
+
     this.findAllLines(/@WorkflowQuery/).forEach(({ line }) => {
       const methodName = this.getNextMethodName(line);
       if (methodName) {
-        nodes.push({ id: this.toId('query_' + methodName), label: methodName + ' (query)', kind: 'query', line });
+        nodes.push({ id: this.toId('query_' + methodName), label: methodName + ' (query)', kind: 'query' as const, line });
       }
     });
 
-    // @WorkflowSignal methods
+    // ── Signal handlers ────────────────────────────────────────────────────
+
     this.findAllLines(/@WorkflowSignal/).forEach(({ line }) => {
       const methodName = this.getNextMethodName(line);
       if (methodName) {
-        nodes.push({ id: this.toId('signal_' + methodName), label: methodName + ' (signal)', kind: 'signal', line });
+        nodes.push({ id: this.toId('signal_' + methodName), label: methodName + ' (signal)', kind: 'signal' as const, line });
       }
     });
 
-    // Workflow.newChildWorkflowStub
+    // ── Update handlers ────────────────────────────────────────────────────
+
+    this.findAllLines(/@WorkflowUpdateHandler/).forEach(({ line }) => {
+      const methodName = this.getNextMethodName(line);
+      if (methodName) {
+        nodes.push({ id: this.toId('update_' + methodName), label: methodName + ' (update)', kind: 'signal' as const, line });
+      }
+    });
+
+    // ── Versioning ─────────────────────────────────────────────────────────
+
+    this.findAllLines(/Workflow\.getVersion\s*\(\s*"([^"]+)"/).forEach(({ line, match }) => {
+      nodes.push({ id: this.toId('version_' + match[1], line), label: 'getVersion: ' + match[1], kind: 'sideEffect' as const, line });
+    });
+
+    // ── Continue-As-New ────────────────────────────────────────────────────
+
+    this.findAllLines(/Workflow\.continueAsNew\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `can_${line}`, label: 'continueAsNew', kind: 'sideEffect' as const, line });
+    });
+
+    // ── Memo & Search Attributes ───────────────────────────────────────────
+
+    this.findAllLines(/Workflow\.upsertMemo\s*\(|Workflow\.upsertTypedMemo\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `upsert_memo_${line}`, label: 'upsertMemo', kind: 'sideEffect' as const, line });
+    });
+    this.findAllLines(/Workflow\.upsertSearchAttributes\s*\(|Workflow\.upsertTypedSearchAttributes\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `upsert_sa_${line}`, label: 'upsertSearchAttributes', kind: 'sideEffect' as const, line });
+    });
+
+    // ── Parallel execution (Promise.allOf) ────────────────────────────────
+
+    this.findAllLines(/Promise\.allOf\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `promise_allof_${line}`, label: 'Promise.allOf (parallel)', kind: 'sideEffect' as const, line });
+    });
+    this.findAllLines(/Promise\.anyOf\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `promise_anyof_${line}`, label: 'Promise.anyOf (race)', kind: 'sideEffect' as const, line });
+    });
+
+    // ── External workflow communication ────────────────────────────────────
+
+    this.findAllLines(/Workflow\.newExternalWorkflowStub\s*\(/).forEach(({ line }) => {
+      nodes.push({ id: `ext_wf_${line}`, label: 'newExternalWorkflowStub', kind: 'childWorkflow' as const, line });
+    });
+
+    // ── Child workflows ────────────────────────────────────────────────────
+
     this.findAllLines(/Workflow\.newChildWorkflowStub\s*\(\s*(\w+)\.class/).forEach(({ line, match }) => {
-      nodes.push({ id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow', line });
+      nodes.push({ id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow' as const, line });
     });
 
     nodes.sort((a, b) => a.line - b.line);
-
     return { name, language: 'java', filePath: this.filePath, nodes, defaultOptions };
   }
 
   private findActivityStubVars(): string[] {
     const vars: string[] = [];
-    // private final XxxActivities activities = Workflow.newActivityStub(...)
-    this.findAllLines(/(?:private|protected)?\s+\w+\s+(\w+)\s*=\s*Workflow\.newActivityStub\s*\(/).forEach(({ match }) => {
-      vars.push(match[1]);
+    // Matches any combination of modifiers (private, public, protected, final, static)
+    // before the type and variable name:
+    //   private final MyActivities acts = Workflow.newActivityStub(
+    //   MyActivities acts = Workflow.newActivityStub(
+    this.findAllLines(
+      /(?:(?:private|public|protected|final|static)\s+)*(\w+)\s+(\w+)\s*=\s*Workflow\.newActivityStub\s*\(/
+    ).forEach(({ match }) => {
+      // match[1] = type, match[2] = variable name
+      if (match[2]) { vars.push(match[2]); }
     });
-    if (vars.length === 0) {
-      // fallback: just look for "activities" as common name
-      vars.push('activities');
-    }
-    return vars;
+    return vars.length > 0 ? vars : ['activities'];
   }
 
   private parseActivityOptions(): ActivityOptions | undefined {
-    // ActivityOptions.newBuilder() ... .build()
     const builderStart = this.findLine(/ActivityOptions\.newBuilder\s*\(\s*\)/);
-    if (builderStart < 0) {
-      // Look for ActivityOptions reference in a constant (another file usually)
-      // Try to get inline options
-      return undefined;
-    }
-
+    if (builderStart < 0) { return undefined; }
     const block = this.extractBlock(builderStart, 30);
     const opts: ActivityOptions = {};
 
-    // .setStartToCloseTimeout(Duration.ofSeconds(5))
     const stc = block.match(/setStartToCloseTimeout\s*\(\s*Duration\.of(Seconds?|Minutes?|Hours?)\s*\(\s*(\d+)\s*\)/);
     if (stc) {
-      const unit = stc[1].toLowerCase().startsWith('second') ? 's' : stc[1].toLowerCase().startsWith('minute') ? 'm' : 'h';
-      opts.startToCloseTimeout = stc[2] + unit;
+      opts.startToCloseTimeout = stc[2] + (stc[1].toLowerCase().startsWith('second') ? 's' : stc[1].toLowerCase().startsWith('minute') ? 'm' : 'h');
     }
-
     const sc = block.match(/setScheduleToCloseTimeout\s*\(\s*Duration\.of(Seconds?|Minutes?|Hours?)\s*\(\s*(\d+)\s*\)/);
     if (sc) {
-      const unit = sc[1].toLowerCase().startsWith('second') ? 's' : sc[1].toLowerCase().startsWith('minute') ? 'm' : 'h';
-      opts.scheduleToCloseTimeout = sc[2] + unit;
+      opts.scheduleToCloseTimeout = sc[2] + (sc[1].toLowerCase().startsWith('second') ? 's' : sc[1].toLowerCase().startsWith('minute') ? 'm' : 'h');
     }
 
-    // RetryOptions
     const retryBlock = block.match(/setRetryOptions\s*\(([\s\S]*?)\)/);
     if (retryBlock) {
       const rp: RetryPolicy = {};
