@@ -97,19 +97,19 @@ export class WorkflowDiagramPanel {
       color: var(--vscode-editor-foreground);
       font-family: var(--vscode-font-family);
       font-size: var(--vscode-font-size);
-      padding: 0;
       height: 100vh;
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
+    /* ── Header ── */
     #header {
-      padding: 8px 16px;
+      padding: 6px 12px;
       border-bottom: 1px solid var(--vscode-panel-border);
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       background: var(--vscode-editorGroupHeader-tabsBackground);
       flex-shrink: 0;
     }
@@ -121,40 +121,172 @@ export class WorkflowDiagramPanel {
     }
     #hint { font-size: 11px; color: var(--vscode-descriptionForeground); }
 
-    #diagram-container {
-      flex: 1; overflow: auto; padding: 24px;
-      display: flex; align-items: flex-start; justify-content: center;
+    /* Zoom buttons */
+    .zoom-btn {
+      width: 26px; height: 26px;
+      border: 1px solid var(--vscode-button-border, #555);
+      background: var(--vscode-button-secondaryBackground, #3a3d41);
+      color: var(--vscode-button-secondaryForeground, #ccc);
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 15px;
+      display: flex; align-items: center; justify-content: center;
+      user-select: none;
+      flex-shrink: 0;
     }
-    #diagram { max-width: 100%; }
-    .mermaid { display: flex; justify-content: center; }
+    .zoom-btn:hover {
+      background: var(--vscode-button-secondaryHoverBackground, #45494e);
+    }
+    #zoom-level {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      min-width: 34px;
+      text-align: center;
+    }
 
-    /* Clickable cursor on all flowchart nodes */
+    /* ── Main split layout ── */
+    #main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Diagram pane ── */
+    #diagram-pane {
+      flex: 1;
+      overflow: auto;
+      padding: 24px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+    }
+    #diagram-wrap {
+      display: inline-block;
+      transform-origin: top center;
+      transition: transform 0.15s ease;
+    }
+    .mermaid { display: block; }
     svg .node { cursor: pointer; }
-    svg .node rect, svg .node circle, svg .node ellipse,
-    svg .node polygon, svg .node path {
-      transition: filter 0.15s ease;
-    }
-    svg .node:hover rect, svg .node:hover circle,
-    svg .node:hover ellipse, svg .node:hover polygon {
-      filter: brightness(1.25) drop-shadow(0 0 4px rgba(0,0,0,0.4));
+    svg .node.node--selected rect,
+    svg .node.node--selected circle,
+    svg .node.node--selected ellipse,
+    svg .node.node--selected polygon {
+      filter: brightness(1.25) drop-shadow(0 0 5px rgba(99,179,237,0.7));
     }
 
-    #tooltip {
-      position: fixed;
-      padding: 10px 14px;
-      background: var(--vscode-editorHoverWidget-background, #252526);
-      border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
-      border-radius: 6px;
+    /* ── Details sidebar ── */
+    #details-pane {
+      width: 0;
+      overflow: hidden;
+      border-left: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-sideBar-background, #252526);
+      display: flex;
+      flex-direction: column;
+      transition: width 0.18s ease;
+      flex-shrink: 0;
+    }
+    #details-pane.open { width: 280px; }
+
+    #details-header {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--vscode-editorGroupHeader-tabsBackground);
+      flex-shrink: 0;
+    }
+    #details-title {
+      flex: 1;
       font-size: 12px;
-      font-family: var(--vscode-editor-font-family, 'Courier New', monospace);
-      line-height: 1.6;
-      white-space: pre;
-      pointer-events: none;
-      display: none;
-      z-index: 9999;
-      color: var(--vscode-editorHoverWidget-foreground, #d4d4d4);
-      max-width: 380px;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #details-close {
+      cursor: pointer;
+      background: none;
+      border: none;
+      color: var(--vscode-descriptionForeground, #888);
+      font-size: 16px;
+      line-height: 1;
+      padding: 0 2px;
+      flex-shrink: 0;
+    }
+    #details-close:hover { color: var(--vscode-foreground, #ccc); }
+
+    #details-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0;
+    }
+
+    /* Property sections */
+    .prop-section {
+      border-bottom: 1px solid var(--vscode-panel-border);
+      overflow: hidden;
+    }
+    .prop-section-title {
+      padding: 6px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--vscode-descriptionForeground, #888);
+      background: var(--vscode-editorGroupHeader-tabsBackground);
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .prop-section-title:hover { color: var(--vscode-foreground, #ccc); }
+    .prop-section-title .chevron { font-size: 9px; transition: transform 0.12s; }
+    .prop-section.collapsed .chevron { transform: rotate(-90deg); }
+    .prop-section-body {
+      padding: 8px 12px;
+    }
+    .prop-section.collapsed .prop-section-body { display: none; }
+
+    .prop-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 5px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .prop-key {
+      color: var(--vscode-symbolIcon-fieldForeground, #9cdcfe);
+      font-weight: 600;
+      flex-shrink: 0;
+      min-width: 60px;
+    }
+    .prop-val {
+      color: var(--vscode-editor-foreground, #d4d4d4);
+      word-break: break-word;
+      font-family: var(--vscode-editor-font-family, monospace);
+    }
+
+    #goto-btn {
+      display: block;
+      margin: 10px 12px 12px;
+      padding: 5px 10px;
+      background: var(--vscode-button-background, #0e639c);
+      color: var(--vscode-button-foreground, #fff);
+      border: none;
+      border-radius: 3px;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: center;
+    }
+    #goto-btn:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
+
+    #details-empty {
+      padding: 24px 16px;
+      color: var(--vscode-descriptionForeground, #888);
+      font-size: 12px;
+      text-align: center;
     }
 
     #error-msg {
@@ -167,51 +299,58 @@ export class WorkflowDiagramPanel {
   <div id="header">
     <h2>${workflowName}</h2>
     <span id="lang-badge">${language}</span>
-    <span id="hint">Click node to jump to source &middot; Hover for options</span>
-  </div>
-  <div id="diagram-container">
-    <div id="diagram">
-      <pre class="mermaid" id="twv-diagram"></pre>
+    <span id="hint">Click any node to inspect it</span>
+    <div style="display:flex;align-items:center;gap:4px;margin-left:auto">
+      <button class="zoom-btn" id="btn-zoom-out" title="Zoom out">&#8722;</button>
+      <span id="zoom-level">100%</span>
+      <button class="zoom-btn" id="btn-zoom-in" title="Zoom in">&#43;</button>
+      <button class="zoom-btn" id="btn-zoom-reset" title="Reset zoom" style="font-size:11px;width:auto;padding:0 6px">Reset</button>
     </div>
-    <div id="error-msg"></div>
   </div>
-  <div id="tooltip"></div>
+
+  <div id="main">
+    <div id="diagram-pane">
+      <div id="diagram-wrap">
+        <pre class="mermaid" id="twv-diagram"></pre>
+        <div id="error-msg"></div>
+      </div>
+    </div>
+
+    <!-- Persistent details sidebar -->
+    <div id="details-pane">
+      <div id="details-header">
+        <span id="details-title">Node Details</span>
+        <button id="details-close" title="Close">&times;</button>
+      </div>
+      <div id="details-body">
+        <div id="details-empty">Select a node to view its properties</div>
+      </div>
+    </div>
+  </div>
 
   <script>
-    // Use var (not const) so these are global and visible inside ES module scripts
-    var NODE_META = ${nodeMetaJson};
-    var FILE_PATH = ${filePathJson};
+    var NODE_META    = ${nodeMetaJson};
+    var FILE_PATH    = ${filePathJson};
     var DIAGRAM_TEXT = ${mermaidJson};
 
     const vscode = acquireVsCodeApi();
 
-    // ── Click handler ───────────────────────────────────────────────────────
-    // Mermaid calls window.temporalNodeClick(nodeId) when securityLevel='loose'
-    // and the directive is:  click <nodeId> call temporalNodeClick
-    // (NO parentheses — with "()" Mermaid passes "" instead of nodeId)
+    // Called by Mermaid click directive — opens sidebar AND navigates to source
     window.temporalNodeClick = function(nodeId) {
       const meta = NODE_META[nodeId];
-      if (!meta) {
-        console.warn('temporalNodeClick: no meta for', nodeId, Object.keys(NODE_META));
-        return;
-      }
+      if (!meta) { return; }
+      // Open the details sidebar (defined in the ES module below)
+      if (window.selectNode) { window.selectNode(nodeId); }
       vscode.postMessage({ command: 'navigateTo', line: meta.line, filePath: FILE_PATH });
     };
 
-    // ── Hover: extract node ID from any SVG child element ──────────────────
-    // Mermaid v11 sets element id = "{diagramId}-flowchart-{nodeId}-{counter}"
-    // where diagramId = the id of the <pre> element = DIAGRAM_EL_ID.
-    // So we strip the known prefix and suffix to recover our nodeId.
     window.getNodeIdFromElement = function(el) {
       const prefix = 'twv-diagram-flowchart-';
       let cur = el;
       while (cur && cur !== document.body) {
         const rawId = cur.getAttribute('id') || '';
         if (rawId.startsWith(prefix)) {
-          // rawId = "twv-diagram-flowchart-validate_41-0"
-          // strip prefix → "validate_41-0"
-          // strip last -digits → "validate_41"
-          const inner = rawId.slice(prefix.length);
+          const inner  = rawId.slice(prefix.length);
           const nodeId = inner.replace(/-\\d+$/, '');
           if (NODE_META[nodeId]) { return nodeId; }
         }
@@ -224,10 +363,13 @@ export class WorkflowDiagramPanel {
   <script type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
 
-    // Use the literal id — 'const' in a classic script is not visible inside ES modules
-    const diagramPre = document.getElementById('twv-diagram');
-    const errorMsg   = document.getElementById('error-msg');
-    const tooltip    = document.getElementById('tooltip');
+    const diagramPre  = document.getElementById('twv-diagram');
+    const diagramWrap = document.getElementById('diagram-wrap');
+    const errorMsg    = document.getElementById('error-msg');
+    const detailsPane  = document.getElementById('details-pane');
+    const detailsTitle = document.getElementById('details-title');
+    const detailsBody  = document.getElementById('details-body');
+    const detailsClose = document.getElementById('details-close');
 
     const isDark = document.body.classList.contains('vscode-dark') ||
                    document.body.classList.contains('vscode-high-contrast');
@@ -235,8 +377,8 @@ export class WorkflowDiagramPanel {
     mermaid.initialize({
       startOnLoad: false,
       theme: isDark ? 'dark' : 'default',
-      flowchart: { useMaxWidth: true, htmlLabels: false, curve: 'basis' },
-      securityLevel: 'loose',   // required for click callbacks to fire
+      flowchart: { useMaxWidth: false, htmlLabels: false, curve: 'basis' },
+      securityLevel: 'loose',
     });
 
     diagramPre.textContent = DIAGRAM_TEXT;
@@ -247,44 +389,93 @@ export class WorkflowDiagramPanel {
       errorMsg.style.display = 'block';
       errorMsg.textContent = 'Diagram render error: ' + (e.message || e);
       console.error('Mermaid error:', e);
+      throw e;
     }
 
-    // ── Hover tooltips ──────────────────────────────────────────────────────
-    const diagramEl = document.getElementById('diagram');
+    // ── Zoom ─────────────────────────────────────────────────────────────────
 
-    diagramEl.addEventListener('mouseover', (e) => {
-      const nodeId = window.getNodeIdFromElement(e.target);
-      if (!nodeId) { tooltip.style.display = 'none'; return; }
+    let zoom = 1.0;
+    const ZOOM_STEP = 0.15, ZOOM_MIN = 0.3, ZOOM_MAX = 3.0;
+
+    function applyZoom() {
+      diagramWrap.style.transform = 'scale(' + zoom + ')';
+      document.getElementById('zoom-level').textContent = Math.round(zoom * 100) + '%';
+    }
+
+    document.getElementById('btn-zoom-in').addEventListener('click', () => {
+      zoom = Math.min(ZOOM_MAX, parseFloat((zoom + ZOOM_STEP).toFixed(2)));
+      applyZoom();
+    });
+    document.getElementById('btn-zoom-out').addEventListener('click', () => {
+      zoom = Math.max(ZOOM_MIN, parseFloat((zoom - ZOOM_STEP).toFixed(2)));
+      applyZoom();
+    });
+    document.getElementById('btn-zoom-reset').addEventListener('click', () => {
+      zoom = 1.0; applyZoom();
+    });
+
+    // ── Details sidebar ───────────────────────────────────────────────────────
+
+    function escHtml(str) {
+      return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    let selectedNodeId = null;
+
+    // Exposed on window so temporalNodeClick (classic script) can call it
+    window.selectNode = function(nodeId) {
       const meta = NODE_META[nodeId];
-      if (!meta) { tooltip.style.display = 'none'; return; }
-      tooltip.textContent = meta.tooltip;
-      tooltip.style.display = 'block';
-      moveTooltip(e);
-    });
+      if (!meta) { return; }
 
-    diagramEl.addEventListener('mousemove', (e) => {
-      if (tooltip.style.display === 'block') { moveTooltip(e); }
-    });
+      // Deselect previous highlight
+      if (selectedNodeId) {
+        const prev = diagramWrap.querySelector('[id^="twv-diagram-flowchart-' + selectedNodeId + '-"]');
+        if (prev) { prev.classList.remove('node--selected'); }
+      }
+      selectedNodeId = nodeId;
+      const cur = diagramWrap.querySelector('[id^="twv-diagram-flowchart-' + nodeId + '-"]');
+      if (cur) { cur.classList.add('node--selected'); }
 
-    diagramEl.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+      // Build sidebar
+      detailsBody.innerHTML = '';
+      detailsTitle.textContent = meta.tooltip.split('\\n')[0] || nodeId;
 
-    diagramEl.addEventListener('mouseout', (e) => {
-      if (!window.getNodeIdFromElement(e.relatedTarget)) {
-        tooltip.style.display = 'none';
+      // Render all tooltip lines as plain rows
+      const lines = meta.tooltip.split('\\n');
+      lines.forEach(line => {
+        const trimmed = line.trim();
+        if (!trimmed) { return; }
+        const row = document.createElement('div');
+        row.className = 'prop-row';
+        const colon = trimmed.indexOf(':');
+        if (colon > 0 && colon < 32) {
+          row.innerHTML =
+            '<span class="prop-key">' + escHtml(trimmed.slice(0, colon).trim()) + '</span>' +
+            '<span class="prop-val">'  + escHtml(trimmed.slice(colon + 1).trim()) + '</span>';
+        } else {
+          row.innerHTML = '<span class="prop-val">' + escHtml(trimmed) + '</span>';
+        }
+        detailsBody.appendChild(row);
+      });
+
+      detailsPane.classList.add('open');
+    };
+
+    detailsClose.addEventListener('click', () => {
+      detailsPane.classList.remove('open');
+      if (selectedNodeId) {
+        const el = diagramWrap.querySelector('[id^="twv-diagram-flowchart-' + selectedNodeId + '-"]');
+        if (el) { el.classList.remove('node--selected'); }
+        selectedNodeId = null;
       }
     });
 
-    function moveTooltip(e) {
-      const tw = tooltip.offsetWidth  || 300;
-      const th = tooltip.offsetHeight || 80;
-      let x = e.clientX + 16;
-      let y = e.clientY + 16;
-      if (x + tw > window.innerWidth  - 8) { x = e.clientX - tw - 8; }
-      if (y + th > window.innerHeight - 8) { y = e.clientY - th - 8; }
-      tooltip.style.left = x + 'px';
-      tooltip.style.top  = y + 'px';
-    }
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { detailsClose.click(); }
+    });
   </script>
+</body>
+</html>\`;
 </body>
 </html>`;
   }
