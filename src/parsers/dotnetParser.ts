@@ -17,16 +17,24 @@ export class DotNetParser extends BaseParser {
 
     const defaultOptions = this.parseActivityOptions();
 
+    // Find the [WorkflowRun] method body so we only pick up flow nodes inside it,
+    // not from private helper methods that may call Workflow.* primitives.
+    const wfMethodRange = this.findWorkflowRunRange();
+
     const tryCatchBlocks = this.findTryCatchBlocks(CS_TRY, CS_CATCH);
     const catchLines  = this.buildCatchLineSet(tryCatchBlocks);
     const tryLineMap  = this.buildTryLineMap(tryCatchBlocks);
 
     const nodes: WorkflowNode[] = [];
 
+    /** Helper: true when a 1-based line is inside the workflow run method */
+    const inWfMethod = (line: number) =>
+      !wfMethodRange || (line >= wfMethodRange.start && line <= wfMethodRange.end);
+
     // ── Activity execution ─────────────────────────────────────────────────
 
     this.findAllLines(/await\s+Workflow\.ExecuteActivityAsync\s*\(/).forEach(({ line }) => {
-      if (catchLines.has(line)) { return; }
+      if (catchLines.has(line) || !inWfMethod(line)) { return; }
       const methodName = this.extractActivityMethodName(line);
       if (!methodName) { return; }
       const tb = tryLineMap.get(line);
@@ -45,7 +53,7 @@ export class DotNetParser extends BaseParser {
 
     // Local activities
     this.findAllLines(/await\s+Workflow\.ExecuteLocalActivityAsync\s*\(/).forEach(({ line }) => {
-      if (catchLines.has(line)) { return; }
+      if (catchLines.has(line) || !inWfMethod(line)) { return; }
       const methodName = this.extractActivityMethodName(line) || 'LocalActivity';
       const tb = tryLineMap.get(line);
       const errorBranches = tb
@@ -66,7 +74,7 @@ export class DotNetParser extends BaseParser {
     this.findAllLines(/\[WorkflowQuery(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/).forEach(({ line, match }) => {
       const qName = match[1] || this.getNextMethodName(line);
       if (qName) {
-        nodes.push({ id: this.toId('query_' + qName), label: qName + ' (query)', kind: 'query', line });
+        nodes.push({ id: this.toId('query_' + qName), label: qName + ' (query)', kind: 'query', role: 'query-handler', line });
       }
     });
 
@@ -75,7 +83,7 @@ export class DotNetParser extends BaseParser {
     this.findAllLines(/\[WorkflowSignal(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/).forEach(({ line, match }) => {
       const sName = match[1] || this.getNextMethodName(line);
       if (sName) {
-        nodes.push({ id: this.toId('signal_' + sName), label: sName + ' (signal)', kind: 'signal', line });
+        nodes.push({ id: this.toId('signal_' + sName), label: sName + ' (signal)', kind: 'signal', role: 'signal-handler', line });
       }
     });
 
@@ -84,14 +92,14 @@ export class DotNetParser extends BaseParser {
     this.findAllLines(/\[WorkflowUpdate(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/).forEach(({ line, match }) => {
       const uName = match[1] || this.getNextMethodName(line);
       if (uName) {
-        nodes.push({ id: this.toId('update_' + uName), label: uName + ' (update)', kind: 'signal', line });
+        nodes.push({ id: this.toId('update_' + uName), label: uName + ' (update)', kind: 'signal', role: 'signal-handler', line });
       }
     });
 
     // ── Timers ─────────────────────────────────────────────────────────────
 
     this.findAllLines(/await\s+Workflow\.DelayAsync\s*\(/).forEach(({ line }) => {
-      if (!catchLines.has(line)) {
+      if (!catchLines.has(line) && inWfMethod(line)) {
         nodes.push({ id: `delay_${line}`, label: 'DelayAsync', kind: 'timer', line });
       }
     });
@@ -99,63 +107,74 @@ export class DotNetParser extends BaseParser {
     // ── Conditions ─────────────────────────────────────────────────────────
 
     this.findAllLines(/await\s+Workflow\.WaitConditionAsync\s*\(/).forEach(({ line }) => {
-      if (!catchLines.has(line)) {
-        nodes.push({ id: `wait_cond_${line}`, label: 'WaitConditionAsync', kind: 'signal', line });
+      if (!catchLines.has(line) && inWfMethod(line)) {
+        nodes.push({ id: `wait_cond_${line}`, label: 'WaitConditionAsync', kind: 'condition', line });
       }
     });
 
     // ── Parallel task composition ──────────────────────────────────────────
 
     this.findAllLines(/await\s+Workflow\.WhenAllAsync\s*\(/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `when_all_${line}`, label: 'WhenAllAsync (parallel)', kind: 'sideEffect', line });
     });
     this.findAllLines(/await\s+Workflow\.WhenAnyAsync\s*\(/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `when_any_${line}`, label: 'WhenAnyAsync (race)', kind: 'sideEffect', line });
     });
 
     // ── Versioning / Patching ─────────────────────────────────────────────
 
     this.findAllLines(/Workflow\.Patched\s*\(\s*["']([^'"]+)["']/).forEach(({ line, match }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: this.toId('patch_' + match[1], line), label: 'Patched: ' + match[1], kind: 'sideEffect', line });
     });
     this.findAllLines(/Workflow\.DeprecatePatch\s*\(\s*["']([^'"]+)["']/).forEach(({ line, match }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: this.toId('deprecate_patch_' + match[1], line), label: 'DeprecatePatch: ' + match[1], kind: 'sideEffect', line });
     });
 
     // ── Side effects / randomness / UUIDs ─────────────────────────────────
 
     this.findAllLines(/Workflow\.NewGuid\s*\(\s*\)/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `new_guid_${line}`, label: 'NewGuid (deterministic)', kind: 'sideEffect', line });
     });
 
     // ── Memo & Search Attributes ───────────────────────────────────────────
 
     this.findAllLines(/Workflow\.UpsertMemo\s*\(/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `upsert_memo_${line}`, label: 'UpsertMemo', kind: 'sideEffect', line });
     });
     this.findAllLines(/Workflow\.UpsertTypedSearchAttributes\s*\(/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `upsert_sa_${line}`, label: 'UpsertTypedSearchAttributes', kind: 'sideEffect', line });
     });
 
     // ── Continue-As-New ────────────────────────────────────────────────────
 
     this.findAllLines(/Workflow\.CreateContinueAsNewException\s*(?:<[^>]+>)?\s*\(/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `can_${line}`, label: 'ContinueAsNew', kind: 'sideEffect', line });
     });
 
     // ── External workflow handles ──────────────────────────────────────────
 
     this.findAllLines(/Workflow\.GetExternalWorkflowHandle\s*(?:<[^>]+>)?\s*\(/).forEach(({ line }) => {
+      if (!inWfMethod(line)) { return; }
       nodes.push({ id: `ext_wf_${line}`, label: 'GetExternalWorkflowHandle', kind: 'childWorkflow', line });
     });
 
     // ── Child workflows ────────────────────────────────────────────────────
 
     this.findAllLines(/await\s+Workflow\.ExecuteChildWorkflowAsync\s*(?:<(\w+)>)?\s*\(/).forEach(({ line, match }) => {
+      if (!inWfMethod(line)) { return; }
       const childName = match[1] || 'ChildWorkflow';
       nodes.push({ id: this.toId('child_' + childName, line), label: childName + ' (child)', kind: 'childWorkflow', line });
     });
     this.findAllLines(/await\s+Workflow\.StartChildWorkflowAsync\s*(?:<(\w+)(?:,\s*\w+)?>)?\s*\(/).forEach(({ line, match }) => {
+      if (!inWfMethod(line)) { return; }
       const childName = match[1] || 'ChildWorkflow';
       nodes.push({ id: this.toId('child_started_' + childName, line), label: childName + ' (child, started)', kind: 'childWorkflow', line });
     });
@@ -163,11 +182,88 @@ export class DotNetParser extends BaseParser {
     // ── Nexus ──────────────────────────────────────────────────────────────
 
     this.findAllLines(/Workflow\.CreateNexusWorkflowClient\s*(?:<[^>]+>)?\s*\(/).forEach(({ line }) => {
-      nodes.push({ id: `nexus_${line}`, label: 'CreateNexusWorkflowClient', kind: 'childWorkflow', line });
+      if (!inWfMethod(line)) { return; }
+      nodes.push({ id: `nexus_${line}`, label: 'CreateNexusWorkflowClient', kind: 'nexus', line });
     });
 
     nodes.sort((a, b) => a.line - b.line);
-    return { name, language: 'csharp', filePath: this.filePath, nodes, defaultOptions };
+    // Loop anchor: only set when there is an actual infinite loop
+    // (`while(true)` / `for(;;)`) wrapping a WaitConditionAsync call.
+    const loopAnchorId = this.detectInfiniteLoopAnchor(wfMethodRange, nodes);
+    return { name, language: 'csharp', filePath: this.filePath, nodes, defaultOptions, loopAnchorId };
+  }
+
+  /**
+   * Detect whether the workflow has an actual infinite loop
+   * (`while(true)` / `for(;;)`) wrapping a WaitConditionAsync call.
+   */
+  private detectInfiniteLoopAnchor(
+    wfRange: { start: number; end: number } | null,
+    nodes: WorkflowNode[]
+  ): string | undefined {
+    const start = wfRange ? wfRange.start - 1 : 0;
+    const end = wfRange ? wfRange.end : this.lines.length;
+    for (let i = start; i < end && i < this.lines.length; i++) {
+      const l = this.lines[i];
+      const isInfiniteLoop =
+        /\bwhile\s*\(\s*true\s*\)/.test(l) ||
+        /\bfor\s*\(\s*;\s*;\s*\)/.test(l);
+      if (!isInfiniteLoop) { continue; }
+
+      let openIdx = i;
+      while (openIdx < this.lines.length && !this.lines[openIdx].includes('{')) { openIdx++; }
+      if (openIdx >= this.lines.length) { continue; }
+
+      let depth = 0;
+      let blockEnd = openIdx;
+      for (let j = openIdx; j < this.lines.length; j++) {
+        depth += (this.lines[j].match(/\{/g) || []).length;
+        depth -= (this.lines[j].match(/\}/g) || []).length;
+        if (depth === 0 && j > openIdx) { blockEnd = j + 1; break; }
+      }
+
+      const bodyStart = openIdx + 2;
+      const bodyEnd = blockEnd;
+
+      const anchorNode = nodes.find(
+        n => (!n.role || n.role === 'flow') && n.kind === 'condition' &&
+             n.line >= bodyStart && n.line <= bodyEnd
+      );
+      if (anchorNode) { return anchorNode.id; }
+    }
+    return undefined;
+  }
+
+  /**
+   * Find the 1-based line range of the [WorkflowRun] method body.
+   * Returns null if not found (falls back to scanning the whole file).
+   */
+  private findWorkflowRunRange(): { start: number; end: number } | null {
+    const annoIdx = this.lines.findIndex(l => /\[WorkflowRun\]/.test(l));
+    if (annoIdx < 0) { return null; }
+
+    // Find the method signature after the annotation
+    let methodIdx = -1;
+    for (let i = annoIdx + 1; i < Math.min(this.lines.length, annoIdx + 5); i++) {
+      if (/(?:public|protected|private|internal)\s+(?:async\s+)?(?:Task|ValueTask)/.test(this.lines[i])) {
+        methodIdx = i;
+        break;
+      }
+    }
+    if (methodIdx < 0) { return null; }
+
+    let depth = 0;
+    let started = false;
+    for (let i = methodIdx; i < this.lines.length; i++) {
+      const opens = (this.lines[i].match(/\{/g) || []).length;
+      const closes = (this.lines[i].match(/\}/g) || []).length;
+      depth += opens - closes;
+      if (opens > 0 && !started) { started = true; }
+      if (started && depth <= 0) {
+        return { start: methodIdx + 1, end: i + 1 }; // 1-based
+      }
+    }
+    return { start: methodIdx + 1, end: this.lines.length };
   }
 
   private extractActivityMethodName(callLine: number): string | undefined {

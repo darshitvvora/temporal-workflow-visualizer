@@ -19,13 +19,41 @@ export class TypeScriptParser extends BaseParser {
     const catchLines = this.buildCatchLineSet(tryCatchBlocks);
     const tryLineMap = this.buildTryLineMap(tryCatchBlocks);
 
-    const nodes: WorkflowNode[] = [];
+    // Determine function body bounds to limit node scanning to the workflow function
+    const funcHeaderLine = this.findLine(new RegExp(`export\\s+async\\s+function\\s+${name}\\s*\\(`));
+    let funcOpenLine = funcHeaderLine;
+    if (funcHeaderLine > 0) {
+      for (let k = funcHeaderLine - 1; k < Math.min(this.lines.length, funcHeaderLine + 10); k++) {
+        if (this.lines[k].includes('{')) { funcOpenLine = k + 1; break; }
+      }
+    }
+
+    // Helper: find the matching closing brace line (1-based) for the block
+    // that opens at or after `startLine` (1-based). Returns last line index.
+    const findBlockEnd = (startLine: number): number => {
+      let depth = 0;
+      for (let i = startLine - 1; i < this.lines.length; i++) {
+        const l = this.lines[i];
+        depth += (l.match(/\{/g) || []).length;
+        depth -= (l.match(/\}/g) || []).length;
+        if (depth === 0 && i >= startLine - 1) { return i + 1; }
+      }
+      return this.lines.length;
+    };
+
+    const funcEndLine = funcOpenLine ? findBlockEnd(funcOpenLine) : this.lines.length;
+
+    /** Helper: true when a 1-based line is inside the workflow function body */
+    const inWfFunc = (line: number) =>
+      !funcHeaderLine || (line >= funcOpenLine && line <= funcEndLine);
+
+    let nodes: WorkflowNode[] = [];
     const seenLines = new Set<number>();
 
     // Activity calls via destructured names: await chargeCard(...)
     for (const actName of activityNames) {
       this.findAllLines(new RegExp(`await\\s+${actName}\\s*\\(`)).forEach(({ line }) => {
-        if (catchLines.has(line) || seenLines.has(line)) { return; }
+        if (catchLines.has(line) || seenLines.has(line) || !inWfFunc(line)) { return; }
         seenLines.add(line);
         const label = actName.replace(/Async$/, '');
         const tb = tryLineMap.get(line);
@@ -48,9 +76,10 @@ export class TypeScriptParser extends BaseParser {
     for (const varName of [...proxyVarNames, ...localProxyVarNames]) {
       const isLocal = localProxyVarNames.includes(varName);
       this.findAllLines(new RegExp(`await\\s+${varName}\\.(\\w+)\\s*\\(`)).forEach(({ line, match }) => {
-        if (catchLines.has(line) || seenLines.has(line)) { return; }
+        if (catchLines.has(line) || seenLines.has(line) || !inWfFunc(line)) { return; }
         seenLines.add(line);
-        const label = match[1].replace(/Async$/, '') + (isLocal ? ' (local)' : '');
+        const baseName = match[1].replace(/Async$/, '');
+        const label = baseName + (isLocal ? ' (local)' : '');
         const tb = tryLineMap.get(line);
         const catchActPat = this.buildCatchActivityPattern(activitySet, proxyVarNames, localProxyVarNames);
         const errorBranches = tb
@@ -59,7 +88,7 @@ export class TypeScriptParser extends BaseParser {
         nodes.push({
           id: this.toId(label, line),
           label,
-          kind: 'activity',
+          kind: isLocal ? 'localActivity' : 'activity',
           line,
           options: defaultOptions ? { ...defaultOptions } : undefined,
           errorBranches: errorBranches?.length ? errorBranches : undefined,
@@ -70,41 +99,41 @@ export class TypeScriptParser extends BaseParser {
     // ── Signal definitions ─────────────────────────────────────────────────
 
     this.findAllLines(/defineSignal\s*(?:<[^>]+>)?\s*\(\s*['"](\w+)['"]\s*\)/).forEach(({ line, match }) => {
-      nodes.push({ id: this.toId('signal_' + match[1]), label: match[1] + ' (signal)', kind: 'signal', line });
+      nodes.push({ id: this.toId('signal_' + match[1]), label: match[1] + ' (signal)', kind: 'signal', role: 'signal-handler', line });
     });
     // setDefaultSignalHandler — dynamic fallback
     this.findAllLines(/setDefaultSignalHandler\s*\(/).forEach(({ line }) => {
-      nodes.push({ id: `default_signal_${line}`, label: 'default signal handler', kind: 'signal', line });
+      nodes.push({ id: `default_signal_${line}`, label: 'default signal handler', kind: 'signal', role: 'signal-handler', line });
     });
 
     // ── Query definitions ──────────────────────────────────────────────────
 
     this.findAllLines(/defineQuery\s*(?:<[^>]+>)?\s*\(\s*['"](\w+)['"]\s*\)/).forEach(({ line, match }) => {
-      nodes.push({ id: this.toId('query_' + match[1]), label: match[1] + ' (query)', kind: 'query', line });
+      nodes.push({ id: this.toId('query_' + match[1]), label: match[1] + ' (query)', kind: 'query', role: 'query-handler', line });
     });
     this.findAllLines(/setDefaultQueryHandler\s*\(/).forEach(({ line }) => {
-      nodes.push({ id: `default_query_${line}`, label: 'default query handler', kind: 'query', line });
+      nodes.push({ id: `default_query_${line}`, label: 'default query handler', kind: 'query', role: 'query-handler', line });
     });
 
     // ── Update definitions ─────────────────────────────────────────────────
 
     this.findAllLines(/defineUpdate\s*(?:<[^>]+>)?\s*\(\s*['"](\w+)['"]\s*\)/).forEach(({ line, match }) => {
-      nodes.push({ id: this.toId('update_' + match[1]), label: match[1] + ' (update)', kind: 'signal', line });
+      nodes.push({ id: this.toId('update_' + match[1]), label: match[1] + ' (update)', kind: 'signal', role: 'signal-handler', line });
     });
     this.findAllLines(/setDefaultUpdateHandler\s*\(/).forEach(({ line }) => {
-      nodes.push({ id: `default_update_${line}`, label: 'default update handler', kind: 'signal', line });
+      nodes.push({ id: `default_update_${line}`, label: 'default update handler', kind: 'signal', role: 'signal-handler', line });
     });
 
     // ── Conditions & timers ────────────────────────────────────────────────
 
     this.findAllLines(/await\s+condition\s*\(/).forEach(({ line }) => {
-      if (!catchLines.has(line)) {
-        nodes.push({ id: `condition_${line}`, label: 'condition', kind: 'signal', line });
+      if (!catchLines.has(line) && inWfFunc(line)) {
+        nodes.push({ id: `condition_${line}`, label: 'condition', kind: 'condition', line });
       }
     });
 
     this.findAllLines(/await\s+sleep\s*\(/).forEach(({ line }) => {
-      if (!catchLines.has(line)) {
+      if (!catchLines.has(line) && inWfFunc(line)) {
         nodes.push({ id: `sleep_${line}`, label: 'sleep', kind: 'timer', line });
       }
     });
@@ -112,62 +141,162 @@ export class TypeScriptParser extends BaseParser {
     // ── Versioning / Patching ─────────────────────────────────────────────
 
     this.findAllLines(/patched\s*\(\s*['"]([^'"]+)['"]\s*\)/).forEach(({ line, match }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: this.toId('patch_' + match[1], line), label: 'patched: ' + match[1], kind: 'sideEffect', line });
     });
     this.findAllLines(/deprecatePatch\s*\(\s*['"]([^'"]+)['"]\s*\)/).forEach(({ line, match }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: this.toId('deprecate_patch_' + match[1], line), label: 'deprecatePatch: ' + match[1], kind: 'sideEffect', line });
     });
 
     // ── Side effects / randomness / UUIDs ─────────────────────────────────
 
     this.findAllLines(/uuid4\s*\(\s*\)/).forEach(({ line }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: `uuid4_${line}`, label: 'uuid4 (idempotencyKey)', kind: 'sideEffect', line });
     });
 
     // ── Memo & Search Attributes ───────────────────────────────────────────
 
     this.findAllLines(/upsertMemo\s*\(/).forEach(({ line }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: `upsert_memo_${line}`, label: 'upsertMemo', kind: 'sideEffect', line });
     });
     this.findAllLines(/upsertSearchAttributes\s*\(/).forEach(({ line }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: `upsert_sa_${line}`, label: 'upsertSearchAttributes', kind: 'sideEffect', line });
     });
 
     // ── Continue-As-New ────────────────────────────────────────────────────
 
     this.findAllLines(/continueAsNew\s*(?:<[^>]+>)?\s*\(|makeContinueAsNewFunc\s*\(/).forEach(({ line }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: `can_${line}`, label: 'continueAsNew', kind: 'sideEffect', line });
     });
 
     // ── External workflow handles ──────────────────────────────────────────
 
     this.findAllLines(/getExternalWorkflowHandle\s*\(/).forEach(({ line }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: `ext_wf_${line}`, label: 'getExternalWorkflowHandle', kind: 'childWorkflow', line });
     });
 
     // ── Child workflows ────────────────────────────────────────────────────
 
     this.findAllLines(/executeChild\s*\(\s*(\w+)/).forEach(({ line, match }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow', line });
     });
     this.findAllLines(/startChild\s*\(\s*(\w+)/).forEach(({ line, match }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: this.toId('child_started_' + match[1], line), label: match[1] + ' (child, started)', kind: 'childWorkflow', line });
     });
 
     // ── Cancellation scopes ────────────────────────────────────────────────
 
     this.findAllLines(/CancellationScope\.(run|withTimeout|cancellable|nonCancellable)\s*\(/).forEach(({ line, match }) => {
+      if (!inWfFunc(line)) { return; }
       nodes.push({ id: `cancel_scope_${line}`, label: 'CancellationScope.' + match[1], kind: 'sideEffect', line });
     });
 
     // ── Nexus ──────────────────────────────────────────────────────────────
 
     this.findAllLines(/createNexusClient\s*(?:<[^>]+>)?\s*\(/).forEach(({ line }) => {
-      nodes.push({ id: `nexus_${line}`, label: 'createNexusClient', kind: 'childWorkflow', line });
+      if (!inWfFunc(line)) { return; }
+      nodes.push({ id: `nexus_${line}`, label: 'createNexusClient', kind: 'nexus', line });
     });
 
     nodes.sort((a, b) => a.line - b.line);
-    return { name, language: 'typescript', filePath: this.filePath, nodes, defaultOptions };
+
+    // Basic control-flow analysis: detect simple for/while loop blocks and
+    // top-level if/else blocks so the diagram generator can render them as
+    // loop regions and conditional branches. This is intentionally simple
+    // (brace-based) to cover common patterns.
+    const loopRegions: Array<{ nodeId: string; bodyStart: number; bodyEnd: number }> = [];
+
+    // We'll perform analysis for loops and if/else, but avoid mutating the
+    // `nodes` list while scanning so both detections can see original nodes.
+    const skippedNodeIds = new Set<string>();
+    const newNodes: WorkflowNode[] = [];
+
+    // Find loops (for/while) within the function body
+    const loopMatches = this.findAllLines(/\b(for|while)\b\s*\(/).filter(m => m.line >= funcOpenLine && m.line <= funcEndLine);
+    for (const m of loopMatches) {
+      // locate opening brace for the loop
+      let openIdx = m.line - 1;
+      while (openIdx < this.lines.length && !this.lines[openIdx].includes('{')) { openIdx++; }
+      if (openIdx >= this.lines.length) { continue; }
+      const blockEnd = findBlockEnd(openIdx + 1);
+      const bodyStart = openIdx + 2; // first line inside braces
+      const bodyEnd = Math.max(openIdx + 1, blockEnd - 1);
+
+      const bodyNodes = nodes.filter(n => (!n.role || n.role === 'flow') && n.line >= bodyStart && n.line <= bodyEnd);
+      if (bodyNodes.length === 0) { continue; }
+
+      // Mark body nodes to be skipped in main flow and register a loop node
+      for (const bn of bodyNodes) { skippedNodeIds.add(bn.id); }
+      const loopId = this.toId('loop_' + m.line);
+      newNodes.push({ id: loopId, label: 'loop', kind: 'loop', line: m.line });
+      loopRegions.push({ nodeId: loopId, bodyStart, bodyEnd });
+    }
+
+    // Rebuild node list excluding skipped nodes, then append the synthetic nodes
+    nodes = nodes.filter(n => !skippedNodeIds.has(n.id)).concat(newNodes);
+    nodes.sort((a, b) => a.line - b.line);
+
+    // Loop anchor: only set when there is an actual infinite loop wrapping a
+    // condition/await (e.g. `while (true) { await condition(...) }`).
+    // A standalone `condition()` call is a one-time wait, NOT a loop.
+    const loopAnchorId = this.detectInfiniteLoopAnchor(funcOpenLine, funcEndLine, nodes);
+    return { name, language: 'typescript', filePath: this.filePath, nodes, defaultOptions, loopAnchorId, loopRegions: loopRegions.length ? loopRegions : undefined };
+  }
+
+  /**
+   * Detect whether the workflow has an actual infinite loop pattern
+   * (e.g. `while (true) { ... await condition(...) ... }`).
+   * Only returns a loop anchor ID when there's a real `while(true)` or `for(;;)`
+   * wrapping a condition/await call. Returns undefined otherwise.
+   */
+  private detectInfiniteLoopAnchor(
+    funcStart: number,
+    funcEnd: number,
+    nodes: WorkflowNode[]
+  ): string | undefined {
+    // Look for while(true) / while(1) / for(;;) patterns in the function body
+    for (let i = funcStart - 1; i < Math.min(this.lines.length, funcEnd); i++) {
+      const l = this.lines[i];
+      const isInfiniteLoop =
+        /\bwhile\s*\(\s*true\s*\)/.test(l) ||
+        /\bwhile\s*\(\s*1\s*\)/.test(l) ||
+        /\bfor\s*\(\s*;\s*;\s*\)/.test(l);
+      if (!isInfiniteLoop) { continue; }
+
+      // Find the block bounds of this loop
+      let openIdx = i;
+      while (openIdx < this.lines.length && !this.lines[openIdx].includes('{')) { openIdx++; }
+      if (openIdx >= this.lines.length) { continue; }
+
+      let depth = 0;
+      let blockEnd = openIdx;
+      for (let j = openIdx; j < this.lines.length; j++) {
+        depth += (this.lines[j].match(/\{/g) || []).length;
+        depth -= (this.lines[j].match(/\}/g) || []).length;
+        if (depth === 0 && j > openIdx) { blockEnd = j + 1; break; }
+      }
+
+      const bodyStart = openIdx + 2; // 1-based first line inside braces
+      const bodyEnd = blockEnd;
+
+      // Find the first condition/await node inside this loop body
+      const anchorNode = nodes.find(
+        n => (!n.role || n.role === 'flow') && n.kind === 'condition' &&
+             n.line >= bodyStart && n.line <= bodyEnd
+      );
+      if (anchorNode) {
+        return anchorNode.id;
+      }
+    }
+    return undefined;
   }
 
   private buildCatchActivityPattern(

@@ -156,14 +156,12 @@ export class WorkflowDiagramPanel {
       flex: 1;
       overflow: auto;
       padding: 24px;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
     }
     #diagram-wrap {
       display: inline-block;
-      transform-origin: top center;
+      transform-origin: top left;
       transition: transform 0.15s ease;
+      min-width: 100%;
     }
     .mermaid { display: block; }
     svg .node { cursor: pointer; }
@@ -314,6 +312,7 @@ export class WorkflowDiagramPanel {
         <pre class="mermaid" id="twv-diagram"></pre>
         <div id="error-msg"></div>
       </div>
+
     </div>
 
     <!-- Persistent details sidebar -->
