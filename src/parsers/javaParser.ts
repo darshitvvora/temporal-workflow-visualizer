@@ -6,24 +6,68 @@ const JAVA_TRY   = /\btry\s*\{/;
 const JAVA_CATCH = /\}\s*catch\s*\((?:[\w|]+\s+(\w+)|(\w+))\s*\)/;
 const JAVA_THROW = /throw\s+new\s+(\w+(?:Exception|Error)?)\s*\(/;
 
+// Known Temporal/Java SDK methods to exclude from helper detection
+const JAVA_TEMPORAL_METHODS = new Set([
+  'sleep', 'await', 'getVersion', 'continueAsNew', 'upsertMemo', 'upsertTypedMemo',
+  'upsertSearchAttributes', 'upsertTypedSearchAttributes', 'newActivityStub',
+  'newLocalActivityStub', 'newChildWorkflowStub', 'newExternalWorkflowStub',
+  'newContinueAsNewStub', 'allOf', 'anyOf', 'getLogger', 'getInfo',
+  // Java built-ins
+  'toString', 'equals', 'hashCode', 'valueOf', 'parseInt', 'get', 'set', 'add',
+  'remove', 'put', 'size', 'isEmpty', 'contains', 'iterator', 'stream',
+  'println', 'printf', 'format', 'log', 'info', 'warn', 'error', 'debug',
+]);
+
 export class JavaParser extends BaseParser {
   parse(): WorkflowModel | null {
-    const classMatch = this.source.match(/public\s+class\s+(\w+)\s+implements\s+\w*[Ww]orkflow/);
-    if (!classMatch) { return null; }
-    const name = classMatch[1].replace(/Impl$/, '');
+    // Find ALL workflow classes, parse each, return the one with the most nodes
+    const entries = this.findAllWorkflowClasses();
+    if (entries.length === 0) { return null; }
 
+    let bestModel: WorkflowModel | null = null;
+    for (const entry of entries) {
+      const model = this.parseWorkflowClass(entry.name, entry.classBounds);
+      if (model && (!bestModel || model.nodes.length > bestModel.nodes.length)) {
+        bestModel = model;
+      }
+    }
+    return bestModel;
+  }
+
+  private findAllWorkflowClasses(): Array<{ name: string; classBounds: { start: number; end: number } }> {
+    const results: Array<{ name: string; classBounds: { start: number; end: number } }> = [];
+    const pattern = /public\s+class\s+(\w+)\s+implements\s+\w*[Ww]orkflow/;
+
+    for (let i = 0; i < this.lines.length; i++) {
+      const m = this.lines[i].match(pattern);
+      if (!m) { continue; }
+      const bounds = this.findBraceFunctionBounds(pattern, i, this.lines.length);
+      if (bounds) {
+        results.push({ name: m[1].replace(/Impl$/, ''), classBounds: bounds });
+        i = bounds.end;
+      }
+    }
+    return results.length > 0 ? results : (() => {
+      // Fallback: original single-match behavior
+      const classMatch = this.source.match(pattern);
+      if (!classMatch) { return []; }
+      return [{ name: classMatch[1].replace(/Impl$/, ''), classBounds: { start: 1, end: this.lines.length } }];
+    })();
+  }
+
+  private parseWorkflowClass(
+    name: string,
+    classBounds: { start: number; end: number }
+  ): WorkflowModel | null {
     const defaultOptions = this.parseActivityOptions();
     const stubVars = this.findActivityStubVars();
 
-    // Find the @WorkflowMethod body so we only pick up flow nodes inside it,
-    // not from private helper methods that may call Workflow.* primitives.
-    const wfMethodRange = this.findWorkflowMethodRange();
+    const wfMethodRange = this.findWorkflowMethodRange(classBounds);
 
     const tryCatchBlocks = this.findTryCatchBlocks(JAVA_TRY, JAVA_CATCH);
     const catchLines  = this.buildCatchLineSet(tryCatchBlocks);
     const tryLineMap  = this.buildTryLineMap(tryCatchBlocks);
 
-    // Activity pattern inside catch: stubVar.methodName(
     const actPat = new RegExp(`(?:${stubVars.join('|')})\\.(\\w+)\\s*\\(`);
 
     const nodes: import('../types').WorkflowNode[] = [];
@@ -31,6 +75,55 @@ export class JavaParser extends BaseParser {
     /** Helper: true when a 1-based line is inside the workflow method body */
     const inWfMethod = (line: number) =>
       !wfMethodRange || (line >= wfMethodRange.start && line <= wfMethodRange.end);
+
+    // ── Helper function detection + inlining ──────────────────────────────
+    const helperRegions = wfMethodRange
+      ? this.collectHelperRegionsBrace(
+          wfMethodRange,
+          /(?:this\.)?(\w+)\s*\(/,
+          JAVA_TEMPORAL_METHODS,
+          (methodName) => this.findJavaMethodBounds(methodName, classBounds),
+        )
+      : [];
+
+    for (const hr of helperRegions) {
+      nodes.push({
+        id: this.toId('fn_' + hr.methodName, hr.callSiteLine),
+        label: hr.methodName + '()',
+        kind: 'functionCall',
+        role: 'flow',
+        line: hr.callSiteLine,
+      });
+    }
+
+    for (const hr of helperRegions) {
+      const helperNodes = this.scanHelperForPrimitives(hr.bounds, [
+        ...stubVars.map(sv => ({
+          pattern: new RegExp(`\\b${sv}\\.(\\w+)\\s*\\(`),
+          nodeFactory: (line: number, match: RegExpMatchArray) => ({
+            id: this.toId(match[1].replace(/Async$/, ''), line),
+            label: match[1].replace(/Async$/, ''),
+            kind: 'activity' as const,
+            line,
+            options: defaultOptions ? { ...defaultOptions } : undefined,
+          }),
+        })),
+        { pattern: /Workflow\.sleep\s*\(/, nodeFactory: (line: number) => ({
+          id: `sleep_${line}`, label: 'sleep', kind: 'timer' as const, line,
+        }) },
+        { pattern: /Workflow\.await\s*\(/, nodeFactory: (line: number) => ({
+          id: `await_cond_${line}`, label: 'Workflow.await (condition)', kind: 'condition' as const, line,
+        }) },
+        { pattern: /Workflow\.newChildWorkflowStub\s*\(\s*(\w+)\.class/, nodeFactory: (line: number, match: RegExpMatchArray) => ({
+          id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow' as const, line,
+        }) },
+        { pattern: /Workflow\.continueAsNew\s*\(/, nodeFactory: (line: number) => ({
+          id: `can_${line}`, label: 'continueAsNew', kind: 'sideEffect' as const, line,
+        }) },
+      ]);
+      this.applyVirtualLines(helperNodes, hr.callSiteLine);
+      nodes.push(...helperNodes);
+    }
 
     // ── Activity calls via stubs ───────────────────────────────────────────
 
@@ -70,9 +163,9 @@ export class JavaParser extends BaseParser {
     });
 
     // ── Query handlers ─────────────────────────────────────────────────────
-    // Signal/query/update handlers are separate methods — do NOT scope to wfMethodRange.
+    // Signal/query/update handlers are class-level — scope to classBounds.
 
-    this.findAllLines(/@WorkflowQuery/).forEach(({ line }) => {
+    this.findAllLinesInBounds(/@WorkflowQuery/, classBounds).forEach(({ line }) => {
       const methodName = this.getNextMethodName(line);
       if (methodName) {
         nodes.push({ id: this.toId('query_' + methodName), label: methodName + ' (query)', kind: 'query' as const, role: 'query-handler' as const, line });
@@ -81,7 +174,7 @@ export class JavaParser extends BaseParser {
 
     // ── Signal handlers ────────────────────────────────────────────────────
 
-    this.findAllLines(/@WorkflowSignal/).forEach(({ line }) => {
+    this.findAllLinesInBounds(/@WorkflowSignal/, classBounds).forEach(({ line }) => {
       const methodName = this.getNextMethodName(line);
       if (methodName) {
         nodes.push({ id: this.toId('signal_' + methodName), label: methodName + ' (signal)', kind: 'signal' as const, role: 'signal-handler' as const, line });
@@ -90,7 +183,7 @@ export class JavaParser extends BaseParser {
 
     // ── Update handlers ────────────────────────────────────────────────────
 
-    this.findAllLines(/@WorkflowUpdateHandler/).forEach(({ line }) => {
+    this.findAllLinesInBounds(/@WorkflowUpdateHandler/, classBounds).forEach(({ line }) => {
       const methodName = this.getNextMethodName(line);
       if (methodName) {
         nodes.push({ id: this.toId('update_' + methodName), label: methodName + ' (update)', kind: 'signal' as const, role: 'signal-handler' as const, line });
@@ -148,10 +241,13 @@ export class JavaParser extends BaseParser {
     });
 
     nodes.sort((a, b) => a.line - b.line);
-    // Loop anchor: only set when there is an actual infinite loop
-    // (`while(true)` / `for(;;)`) wrapping a Workflow.await() call.
     const loopAnchorId = this.detectInfiniteLoopAnchor(wfMethodRange, nodes);
     return { name, language: 'java', filePath: this.filePath, nodes, defaultOptions, loopAnchorId };
+  }
+
+  private findJavaMethodBounds(name: string, classBounds: { start: number; end: number }): { start: number; end: number } | null {
+    const pat = new RegExp(`(?:private|protected|public)\\s+(?:static\\s+)?\\S+\\s+${name}\\s*\\(`);
+    return this.findBraceFunctionBounds(pat, classBounds.start - 1, classBounds.end);
   }
 
   /**
@@ -214,8 +310,13 @@ export class JavaParser extends BaseParser {
    * Find the 1-based line range of the @WorkflowMethod body.
    * Returns null if not found (falls back to scanning the whole file).
    */
-  private findWorkflowMethodRange(): { start: number; end: number } | null {
-    const annoIdx = this.lines.findIndex(l => /@WorkflowMethod/.test(l));
+  private findWorkflowMethodRange(searchBounds?: { start: number; end: number }): { start: number; end: number } | null {
+    const searchStart = searchBounds ? searchBounds.start - 1 : 0;
+    const searchEnd = searchBounds ? Math.min(this.lines.length, searchBounds.end) : this.lines.length;
+    let annoIdx = -1;
+    for (let i = searchStart; i < searchEnd; i++) {
+      if (/@WorkflowMethod/.test(this.lines[i])) { annoIdx = i; break; }
+    }
     if (annoIdx < 0) { return null; }
 
     // Find the method signature after the annotation

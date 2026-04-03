@@ -8,23 +8,70 @@ const PHP_CATCH = /\}\s*catch\s*\(\s*(\w+(?:\|\w+)*)\s+\$\w+\s*\)/;
 const PHP_ACT   = /yield\s+\$(?:this->\w+|\w+)->(\w+)\s*\(/;
 const PHP_THROW = /throw\s+new\s+(\w+(?:Exception)?)\s*\(/;
 
+// Known Temporal/PHP SDK methods to exclude from helper detection
+const PHP_TEMPORAL_METHODS = new Set([
+  'timer', 'await', 'awaitWithTimeout', 'sideEffect', 'getVersion',
+  'uuid4', 'uuid7', 'uuid', 'upsertMemo', 'upsertSearchAttributes',
+  'upsertTypedSearchAttributes', 'newContinueAsNewStub', 'continueAsNew',
+  'newExternalWorkflowStub', 'newUntypedExternalWorkflowStub',
+  'newChildWorkflowStub', 'newUntypedChildWorkflowStub', 'executeChildWorkflow',
+  'async', 'asyncDetached', 'registerSignal', 'registerDynamicSignal',
+  'registerQuery', 'registerDynamicQuery', 'registerUpdate', 'registerDynamicUpdate',
+  // PHP built-ins
+  'array_push', 'array_pop', 'array_merge', 'array_map', 'array_filter',
+  'count', 'strlen', 'substr', 'trim', 'explode', 'implode', 'sprintf',
+  'json_encode', 'json_decode', 'var_dump', 'print_r', 'echo',
+]);
+
 export class PhpParser extends BaseParser {
   parse(): WorkflowModel | null {
-    const classMatch = this.source.match(/class\s+(\w+)\s+(?:extends\s+\w+\s+)?implements\s+WorkflowInterface/);
-    if (!classMatch) {
-      const attrMatch = this.source.match(/(?:#\[WorkflowInterface\]|@WorkflowInterface)[\s\S]*?class\s+(\w+)/);
-      if (!attrMatch) { return null; }
-      return this.buildModel(attrMatch[1]);
+    // Find all workflow classes, parse each, return the best
+    const entries = this.findAllWorkflowClasses();
+    if (entries.length === 0) { return null; }
+
+    let bestModel: WorkflowModel | null = null;
+    for (const entry of entries) {
+      const model = this.buildModel(entry.name, entry.classBounds);
+      if (model && (!bestModel || model.nodes.length > bestModel.nodes.length)) {
+        bestModel = model;
+      }
     }
-    return this.buildModel(classMatch[1]);
+    return bestModel;
   }
 
-  private buildModel(name: string): WorkflowModel {
+  private findAllWorkflowClasses(): Array<{ name: string; classBounds: { start: number; end: number } }> {
+    const results: Array<{ name: string; classBounds: { start: number; end: number } }> = [];
+    const patterns = [
+      /class\s+(\w+)\s+(?:extends\s+\w+\s+)?implements\s+WorkflowInterface/,
+      /(?:#\[WorkflowInterface\]|@WorkflowInterface)[\s\S]*?class\s+(\w+)/,
+    ];
+
+    for (let i = 0; i < this.lines.length; i++) {
+      for (const pat of patterns) {
+        const m = this.lines[i].match(pat);
+        if (!m) { continue; }
+        const bounds = this.findBraceFunctionBounds(/class\s+\w+/, i, this.lines.length);
+        if (bounds) {
+          results.push({ name: m[1], classBounds: bounds });
+          i = bounds.end;
+          break;
+        }
+      }
+    }
+    if (results.length === 0) {
+      // Fallback
+      const classMatch = this.source.match(/class\s+(\w+)\s+(?:extends\s+\w+\s+)?implements\s+WorkflowInterface/);
+      const attrMatch = this.source.match(/(?:#\[WorkflowInterface\]|@WorkflowInterface)[\s\S]*?class\s+(\w+)/);
+      const name = classMatch?.[1] || attrMatch?.[1];
+      if (name) { results.push({ name, classBounds: { start: 1, end: this.lines.length } }); }
+    }
+    return results;
+  }
+
+  private buildModel(name: string, classBounds: { start: number; end: number }): WorkflowModel {
     const nodes: WorkflowNode[] = [];
 
-    // Find the #[WorkflowMethod] / @WorkflowMethod entry point body so we only
-    // pick up flow nodes inside it, not from private helper methods.
-    const wfMethodRange = this.findWorkflowMethodRange();
+    const wfMethodRange = this.findWorkflowMethodRange(classBounds);
 
     const tryCatchBlocks = this.findTryCatchBlocks(PHP_TRY, PHP_CATCH);
     const catchLines  = this.buildCatchLineSet(tryCatchBlocks);
@@ -33,6 +80,54 @@ export class PhpParser extends BaseParser {
     /** Helper: true when a 1-based line is inside the workflow method body */
     const inWfMethod = (line: number) =>
       !wfMethodRange || (line >= wfMethodRange.start && line <= wfMethodRange.end);
+
+    // ── Helper function detection + inlining ──────────────────────────────
+    const helperRegions = wfMethodRange
+      ? this.collectHelperRegionsBrace(
+          wfMethodRange,
+          /\$this->(\w+)\s*\(/,
+          PHP_TEMPORAL_METHODS,
+          (methodName) => this.findPhpMethodBounds(methodName, classBounds),
+        )
+      : [];
+
+    for (const hr of helperRegions) {
+      nodes.push({
+        id: this.toId('fn_' + hr.methodName, hr.callSiteLine),
+        label: hr.methodName + '()',
+        kind: 'functionCall',
+        role: 'flow',
+        line: hr.callSiteLine,
+      });
+    }
+
+    for (const hr of helperRegions) {
+      const helperNodes = this.scanHelperForPrimitives(hr.bounds, [
+        { pattern: /yield\s+\$(?:this->\w+|\w+)->(\w+)\s*\(/, nodeFactory: (line, match) => ({
+          id: this.toId(match[1], line), label: match[1], kind: 'activity' as const, line,
+        }) },
+        { pattern: /Workflow::executeActivity\s*\(\s*['"](\w+)["']/, nodeFactory: (line, match) => ({
+          id: this.toId('act_' + match[1], line), label: match[1], kind: 'activity' as const, line,
+        }) },
+        { pattern: /(?:Workflow::timer|yield\s+Workflow::timer)\s*\(/, nodeFactory: (line) => ({
+          id: `timer_${line}`, label: 'timer', kind: 'timer' as const, line,
+        }) },
+        { pattern: /Workflow::await\s*\(/, nodeFactory: (line) => ({
+          id: `await_cond_${line}`, label: 'Workflow::await (condition)', kind: 'condition' as const, line,
+        }) },
+        { pattern: /Workflow::awaitWithTimeout\s*\(/, nodeFactory: (line) => ({
+          id: `await_timeout_${line}`, label: 'awaitWithTimeout', kind: 'condition' as const, line,
+        }) },
+        { pattern: /Workflow::newChildWorkflowStub\s*\(\s*(\w+)::class/, nodeFactory: (line, match) => ({
+          id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow' as const, line,
+        }) },
+        { pattern: /Workflow::continueAsNew\s*\(|Workflow::newContinueAsNewStub\s*\(/, nodeFactory: (line) => ({
+          id: `can_${line}`, label: 'continueAsNew', kind: 'sideEffect' as const, line,
+        }) },
+      ]);
+      this.applyVirtualLines(helperNodes, hr.callSiteLine);
+      nodes.push(...helperNodes);
+    }
 
     // ── Activity calls ─────────────────────────────────────────────────────
 
@@ -61,7 +156,7 @@ export class PhpParser extends BaseParser {
     // ── Signal handlers ────────────────────────────────────────────────────
 
     // @SignalMethod or #[SignalMethod] (PHP 8 attribute)
-    this.findAllLines(/#\[SignalMethod[^\]]*\]|@SignalMethod/).forEach(({ line }) => {
+    this.findAllLinesInBounds(/#\[SignalMethod[^\]]*\]|@SignalMethod/, classBounds).forEach(({ line }) => {
       const methodName = this.getNextPhpMethodName(line);
       if (methodName) {
         nodes.push({ id: this.toId('signal_' + methodName), label: methodName + ' (signal)', kind: 'signal', role: 'signal-handler', line });
@@ -78,7 +173,7 @@ export class PhpParser extends BaseParser {
     // ── Query handlers ─────────────────────────────────────────────────────
 
     // @QueryMethod or #[QueryMethod] (PHP 8 attribute)
-    this.findAllLines(/#\[QueryMethod[^\]]*\]|@QueryMethod/).forEach(({ line }) => {
+    this.findAllLinesInBounds(/#\[QueryMethod[^\]]*\]|@QueryMethod/, classBounds).forEach(({ line }) => {
       const methodName = this.getNextPhpMethodName(line);
       if (methodName) {
         nodes.push({ id: this.toId('query_' + methodName), label: methodName + ' (query)', kind: 'query', role: 'query-handler', line });
@@ -93,7 +188,7 @@ export class PhpParser extends BaseParser {
 
     // ── Update handlers ────────────────────────────────────────────────────
 
-    this.findAllLines(/#\[UpdateMethod[^\]]*\]|@UpdateMethod/).forEach(({ line }) => {
+    this.findAllLinesInBounds(/#\[UpdateMethod[^\]]*\]|@UpdateMethod/, classBounds).forEach(({ line }) => {
       const methodName = this.getNextPhpMethodName(line);
       if (methodName) {
         nodes.push({ id: this.toId('update_' + methodName), label: methodName + ' (update)', kind: 'signal', role: 'signal-handler', line });
@@ -249,8 +344,18 @@ export class PhpParser extends BaseParser {
    * Find the 1-based line range of the #[WorkflowMethod] / @WorkflowMethod body.
    * Returns null if not found (falls back to scanning the whole file).
    */
-  private findWorkflowMethodRange(): { start: number; end: number } | null {
-    const annoIdx = this.lines.findIndex(l => /#\[WorkflowMethod[^\]]*\]|@WorkflowMethod/.test(l));
+  private findPhpMethodBounds(name: string, classBounds: { start: number; end: number }): { start: number; end: number } | null {
+    const pat = new RegExp(`(?:private|protected|public)\\s+function\\s+${name}\\s*\\(`);
+    return this.findBraceFunctionBounds(pat, classBounds.start - 1, classBounds.end);
+  }
+
+  private findWorkflowMethodRange(searchBounds?: { start: number; end: number }): { start: number; end: number } | null {
+    const searchStart = searchBounds ? searchBounds.start - 1 : 0;
+    const searchEnd = searchBounds ? Math.min(this.lines.length, searchBounds.end) : this.lines.length;
+    let annoIdx = -1;
+    for (let i = searchStart; i < searchEnd; i++) {
+      if (/#\[WorkflowMethod[^\]]*\]|@WorkflowMethod/.test(this.lines[i])) { annoIdx = i; break; }
+    }
     if (annoIdx < 0) { return null; }
 
     // Find the function signature after the annotation

@@ -1,20 +1,56 @@
 import { BaseParser } from './baseParser';
 import { WorkflowModel, WorkflowNode, ActivityOptions, ErrorBranch } from '../types';
 
+// Known Temporal/Go SDK function names to exclude from helper detection
+const GO_TEMPORAL_METHODS = new Set([
+  'ExecuteActivity', 'ExecuteLocalActivity', 'GetSignalChannel', 'GetSignalChannelWithOptions',
+  'SetQueryHandler', 'SetQueryHandlerWithOptions', 'SetUpdateHandler', 'SetUpdateHandlerWithOptions',
+  'Sleep', 'NewTimer', 'Await', 'AwaitWithTimeout', 'Go', 'SideEffect', 'MutableSideEffect',
+  'GetVersion', 'ExecuteChildWorkflow', 'NewContinueAsNewError', 'UpsertMemo',
+  'UpsertTypedSearchAttributes', 'UpsertSearchAttributes', 'CreateSession', 'NewNexusClient',
+  'SignalExternalWorkflow', 'SetQueryHandlerFor',
+  // Go built-ins
+  'append', 'make', 'len', 'cap', 'delete', 'close', 'panic', 'recover', 'print', 'println',
+  'fmt', 'log', 'errors', 'context', 'time', 'strings', 'strconv',
+]);
+
 export class GoParser extends BaseParser {
   parse(): WorkflowModel | null {
-    const wfMatch = this.source.match(/func\s+(\w+)\s*\(ctx workflow\.Context/);
-    if (!wfMatch) { return null; }
-    const name = wfMatch[1];
+    // Find ALL workflow functions, parse each, return the one with the most nodes
+    const wfEntries = this.findAllWorkflowFunctions();
+    if (wfEntries.length === 0) { return null; }
 
-    // Determine the line range of the workflow function body so we only
-    // parse nodes that belong to it (ignoring helper functions).
-    const wfRange = this.findWorkflowFuncRange(wfMatch[0]);
+    let bestModel: WorkflowModel | null = null;
+    for (const entry of wfEntries) {
+      const model = this.parseWorkflowFunc(entry.name, entry.signature, entry.range);
+      if (model && (!bestModel || model.nodes.length > bestModel.nodes.length)) {
+        bestModel = model;
+      }
+    }
+    return bestModel;
+  }
 
-    // Build a set of lines inside `if err != nil { ... }` blocks so we can
-    // exclude compensation / rollback activities from the main flow.
+  private findAllWorkflowFunctions(): Array<{ name: string; signature: string; range: { start: number; end: number } }> {
+    const results: Array<{ name: string; signature: string; range: { start: number; end: number } }> = [];
+    const pattern = /func\s+(\w+)\s*\(ctx workflow\.Context/;
+
+    for (let i = 0; i < this.lines.length; i++) {
+      const m = this.lines[i].match(pattern);
+      if (!m) { continue; }
+      const sig = m[0];
+      const range = this.findWorkflowFuncRange(sig);
+      results.push({ name: m[1], signature: sig, range });
+      i = range.end - 1; // skip past this function
+    }
+    return results;
+  }
+
+  private parseWorkflowFunc(
+    name: string,
+    _signature: string,
+    wfRange: { start: number; end: number }
+  ): WorkflowModel | null {
     const errBlockLines = this.buildErrBlockLineSet(wfRange);
-
     const defaultOptions = this.parseActivityOptions();
     const nodes: WorkflowNode[] = [];
 
@@ -24,6 +60,59 @@ export class GoParser extends BaseParser {
 
     /** Helper: true when a 1-based line is inside an `if err != nil` block */
     const inErrBlock = (line: number) => errBlockLines.has(line);
+
+    // ── Helper function detection + inlining ──────────────────────────────
+    const helperRegions = this.collectHelperRegionsBrace(
+      wfRange,
+      /\b(\w+)\s*\(/,
+      GO_TEMPORAL_METHODS,
+      (methodName) => this.findGoFunctionBounds(methodName),
+    );
+
+    for (const hr of helperRegions) {
+      nodes.push({
+        id: this.toId('fn_' + hr.methodName, hr.callSiteLine),
+        label: hr.methodName + '()',
+        kind: 'functionCall',
+        role: 'flow',
+        line: hr.callSiteLine,
+      });
+    }
+
+    for (const hr of helperRegions) {
+      const helperNodes = this.scanHelperForPrimitives(hr.bounds, [
+        { pattern: /workflow\.ExecuteActivity\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/, nodeFactory: (line, match) => ({
+          id: this.toId(match[1], line), label: match[1], kind: 'activity', line,
+          options: defaultOptions ? { ...defaultOptions } : undefined,
+        }) },
+        { pattern: /workflow\.ExecuteLocalActivity\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/, nodeFactory: (line, match) => ({
+          id: this.toId('local_' + match[1], line), label: match[1] + ' (local)', kind: 'localActivity', line,
+        }) },
+        { pattern: /workflow\.Sleep\s*\(/, nodeFactory: (line) => ({
+          id: `sleep_${line}`, label: 'Sleep', kind: 'timer', line,
+        }) },
+        { pattern: /workflow\.NewTimer\s*\(/, nodeFactory: (line) => ({
+          id: `timer_${line}`, label: 'NewTimer', kind: 'timer', line,
+        }) },
+        { pattern: /workflow\.Await\s*\(/, nodeFactory: (line) => ({
+          id: `await_${line}`, label: 'Await (condition)', kind: 'condition', line,
+        }) },
+        { pattern: /workflow\.AwaitWithTimeout\s*\(/, nodeFactory: (line) => ({
+          id: `await_timeout_${line}`, label: 'AwaitWithTimeout', kind: 'condition', line,
+        }) },
+        { pattern: /workflow\.ExecuteChildWorkflow\s*\(\s*ctx,\s*(?:\w+\.)?(\w+)/, nodeFactory: (line, match) => ({
+          id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow', line,
+        }) },
+        { pattern: /workflow\.NewContinueAsNewError\s*\(/, nodeFactory: (line) => ({
+          id: `can_${line}`, label: 'ContinueAsNew', kind: 'sideEffect', line,
+        }) },
+        { pattern: /workflow\.Go\s*\(/, nodeFactory: (line) => ({
+          id: `goroutine_${line}`, label: 'workflow.Go (goroutine)', kind: 'sideEffect', line,
+        }) },
+      ]);
+      this.applyVirtualLines(helperNodes, hr.callSiteLine);
+      nodes.push(...helperNodes);
+    }
 
     // ── Activities ──────────────────────────────────────────────────────────
 
@@ -185,10 +274,25 @@ export class GoParser extends BaseParser {
     });
 
     nodes.sort((a, b) => a.line - b.line);
-    // Loop anchor: only set when there is an actual infinite loop (`for { ... }`)
-    // wrapping an Await/condition call. A standalone Await is a one-time wait.
     const loopAnchorId = this.detectInfiniteLoopAnchor(wfRange, nodes);
     return { name, language: 'go', filePath: this.filePath, nodes, defaultOptions, loopAnchorId };
+  }
+
+  /**
+   * Find a Go function's body bounds by name. Handles both:
+   * - `func FuncName(` — standalone function
+   * - `func (s *Type) MethodName(` — method on struct
+   */
+  private findGoFunctionBounds(name: string): { start: number; end: number } | null {
+    const patterns = [
+      new RegExp(`\\bfunc\\s+${name}\\s*\\(`),
+      new RegExp(`\\bfunc\\s+\\(\\w+\\s+\\*?\\w+\\)\\s+${name}\\s*\\(`),
+    ];
+    for (const pat of patterns) {
+      const bounds = this.findBraceFunctionBounds(pat);
+      if (bounds) { return bounds; }
+    }
+    return null;
   }
 
   /**

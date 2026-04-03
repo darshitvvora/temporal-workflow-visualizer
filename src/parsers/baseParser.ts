@@ -220,4 +220,153 @@ export abstract class BaseParser {
       line: cb.start,
     }));
   }
+
+  // ── Shared helper function inlining utilities ─────────────────────────────
+
+  /**
+   * Like findAllLines but restricted to lines within [bounds.start, bounds.end] (inclusive, 1-based).
+   * When bounds is null, falls back to full-file scan.
+   */
+  protected findAllLinesInBounds(
+    pattern: RegExp,
+    bounds: { start: number; end: number } | null
+  ): Array<{ line: number; match: RegExpMatchArray }> {
+    const all = this.findAllLines(pattern);
+    if (!bounds) { return all; }
+    return all.filter(r => r.line >= bounds.start && r.line <= bounds.end);
+  }
+
+  /**
+   * Reassign line numbers to virtual fractional values based on call site.
+   * Nodes are sorted by their actual line first, then assigned
+   * callSiteLine + (rank+1)*0.001 so they sort correctly in the flow.
+   */
+  protected applyVirtualLines(nodes: WorkflowNode[], callSiteLine: number): void {
+    nodes.sort((a, b) => a.line - b.line);
+    nodes.forEach((n, idx) => {
+      n.line = callSiteLine + (idx + 1) * 0.001;
+    });
+  }
+
+  /**
+   * Find a function/method body using brace counting.
+   * Searches for a line matching `signaturePattern`, then finds the opening `{`
+   * and counts braces to determine the body end.
+   * Returns 1-based { start, end } bounds of the body (inside the braces), or null.
+   */
+  protected findBraceFunctionBounds(
+    signaturePattern: RegExp,
+    searchStart = 0,
+    searchEnd = this.lines.length
+  ): { start: number; end: number } | null {
+    let sigIdx = -1;
+    for (let i = searchStart; i < searchEnd; i++) {
+      if (signaturePattern.test(this.lines[i])) { sigIdx = i; break; }
+    }
+    if (sigIdx < 0) { return null; }
+
+    // Find opening brace
+    let openIdx = sigIdx;
+    while (openIdx < this.lines.length && !this.lines[openIdx].includes('{')) { openIdx++; }
+    if (openIdx >= this.lines.length) { return null; }
+
+    // Count braces to find end
+    let depth = 0;
+    let blockEnd = openIdx;
+    for (let j = openIdx; j < this.lines.length; j++) {
+      depth += (this.lines[j].match(/\{/g) || []).length;
+      depth -= (this.lines[j].match(/\}/g) || []).length;
+      if (depth === 0 && j > openIdx) { blockEnd = j; break; }
+    }
+
+    return { start: openIdx + 2, end: blockEnd }; // 1-based, inside braces
+  }
+
+  /**
+   * Detect helper function calls within bounds, excluding known SDK methods.
+   * Returns call site lines and function names.
+   * `callPattern` should capture the function/method name in group 1.
+   * `excludeSet` contains known framework method names to skip.
+   */
+  protected findHelperCallsInBoundsGeneric(
+    bounds: { start: number; end: number },
+    callPattern: RegExp,
+    excludeSet: Set<string>
+  ): Array<{ line: number; methodName: string }> {
+    const results: Array<{ line: number; methodName: string }> = [];
+    for (let i = bounds.start - 1; i < Math.min(this.lines.length, bounds.end); i++) {
+      const l = this.lines[i];
+      if (l.trimStart().startsWith('//') || l.trimStart().startsWith('#') || l.trimStart().startsWith('*')) { continue; }
+      const global = new RegExp(callPattern.source, callPattern.flags.includes('g') ? callPattern.flags : callPattern.flags + 'g');
+      let m: RegExpExecArray | null;
+      while ((m = global.exec(l)) !== null) {
+        const name = m[1];
+        if (name && !excludeSet.has(name) && !results.some(r => r.line === i + 1 && r.methodName === name)) {
+          results.push({ line: i + 1, methodName: name });
+        }
+      }
+    }
+    return results;
+  }
+
+  private static readonly MAX_HELPER_DEPTH = 3;
+
+  /**
+   * Collect helper method regions called from bounds, recursively up to depth 3.
+   * `callPattern` and `excludeSet` are passed to findHelperCallsInBounds.
+   * `findBounds` is a function that finds the body bounds of a named method/function.
+   */
+  protected collectHelperRegionsBrace(
+    bounds: { start: number; end: number },
+    callPattern: RegExp,
+    excludeSet: Set<string>,
+    findBounds: (name: string) => { start: number; end: number } | null,
+    depth = 0,
+    visited = new Set<string>()
+  ): Array<{ methodName: string; callSiteLine: number; bounds: { start: number; end: number } }> {
+    if (depth >= BaseParser.MAX_HELPER_DEPTH) { return []; }
+
+    const results: Array<{ methodName: string; callSiteLine: number; bounds: { start: number; end: number } }> = [];
+    const calls = this.findHelperCallsInBoundsGeneric(bounds, callPattern, excludeSet);
+
+    for (const { line, methodName } of calls) {
+      if (visited.has(methodName)) { continue; }
+      const helperBounds = findBounds(methodName);
+      if (!helperBounds) { continue; }
+
+      const nextVisited = new Set(visited);
+      nextVisited.add(methodName);
+
+      results.push({ methodName, callSiteLine: line, bounds: helperBounds });
+
+      // Recurse
+      const nested = this.collectHelperRegionsBrace(
+        helperBounds, callPattern, excludeSet, findBounds, depth + 1, nextVisited
+      );
+      results.push(...nested);
+    }
+
+    return results;
+  }
+
+  /**
+   * Scan a helper region for all Temporal primitives using the provided patterns.
+   * Returns nodes with original (non-virtual) lines.
+   * Each entry in `patterns` is { pattern, nodeFactory }.
+   */
+  protected scanHelperForPrimitives(
+    helperBounds: { start: number; end: number },
+    patterns: Array<{
+      pattern: RegExp;
+      nodeFactory: (line: number, match: RegExpMatchArray) => WorkflowNode;
+    }>
+  ): WorkflowNode[] {
+    const nodes: WorkflowNode[] = [];
+    for (const { pattern, nodeFactory } of patterns) {
+      this.findAllLinesInBounds(pattern, helperBounds).forEach(({ line, match }) => {
+        nodes.push(nodeFactory(line, match));
+      });
+    }
+    return nodes;
+  }
 }

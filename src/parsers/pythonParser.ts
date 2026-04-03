@@ -443,18 +443,6 @@ export class PythonParser extends BaseParser {
   }
 
   /**
-   * Reassign line numbers to virtual fractional values based on call site.
-   * Nodes are sorted by their actual line first, then assigned
-   * callSiteLine + (rank+1)*0.001 so they sort correctly in the flow.
-   */
-  private applyVirtualLines(nodes: WorkflowNode[], callSiteLine: number): void {
-    nodes.sort((a, b) => a.line - b.line);
-    nodes.forEach((n, idx) => {
-      n.line = callSiteLine + (idx + 1) * 0.001;
-    });
-  }
-
-  /**
    * Scan a pattern in both the run body bounds AND all helper regions,
    * applying virtual line numbers for helper results.
    * nodeFactory receives (actualLine, match) and returns a WorkflowNode.
@@ -693,19 +681,6 @@ export class PythonParser extends BaseParser {
     }
 
     return { start: bodyStart, end: bodyEnd - 1 };
-  }
-
-  /**
-   * Like findAllLines but restricted to lines within [bounds.start, bounds.end] (inclusive, 1-based).
-   * When bounds is null, falls back to full-file scan.
-   */
-  private findAllLinesInBounds(
-    pattern: RegExp,
-    bounds: { start: number; end: number } | null
-  ): Array<{ line: number; match: RegExpMatchArray }> {
-    const all = this.findAllLines(pattern);
-    if (!bounds) { return all; }
-    return all.filter(r => r.line >= bounds.start && r.line <= bounds.end);
   }
 
   // ── Activity call parsing ────────────────────────────────────────────────

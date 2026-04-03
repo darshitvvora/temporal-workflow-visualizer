@@ -8,18 +8,68 @@ const CS_CATCH = /\}\s*catch\s*\(\s*(\w+(?:\s*\|\s*\w+)*)(?:\s+\w+)?\s*\)/;
 const CS_ACT   = /(?:=>\s*\w+\.(\w+)\s*\(|nameof\s*\(\s*\w+\.(\w+)\s*\)|["'](\w+)["'])/;
 const CS_THROW = /throw\s+new\s+(\w+(?:Exception)?)\s*\(/;
 
+// Known Temporal/.NET SDK methods to exclude from helper detection
+const CS_TEMPORAL_METHODS = new Set([
+  'ExecuteActivityAsync', 'ExecuteLocalActivityAsync', 'DelayAsync', 'WaitConditionAsync',
+  'WhenAllAsync', 'WhenAnyAsync', 'Patched', 'DeprecatePatch', 'NewGuid',
+  'UpsertMemo', 'UpsertTypedSearchAttributes', 'CreateContinueAsNewException',
+  'GetExternalWorkflowHandle', 'ExecuteChildWorkflowAsync', 'StartChildWorkflowAsync',
+  'CreateNexusWorkflowClient',
+  // C# built-ins
+  'ToString', 'Equals', 'GetHashCode', 'GetType', 'Add', 'Remove', 'Contains',
+  'Count', 'Clear', 'ToList', 'ToArray', 'Select', 'Where', 'Any', 'All',
+  'First', 'FirstOrDefault', 'Single', 'SingleOrDefault',
+  'Console', 'WriteLine', 'Write', 'Log', 'LogInformation', 'LogWarning', 'LogError',
+]);
+
 export class DotNetParser extends BaseParser {
   parse(): WorkflowModel | null {
-    const hasAttr = /\[Workflow\]/.test(this.source);
-    const classMatch = this.source.match(/public\s+class\s+(\w+)/);
-    if (!classMatch || (!hasAttr && !/[Ww]orkflow/.test(classMatch[1]))) { return null; }
-    const name = classMatch[1];
+    // Find ALL workflow classes, parse each, return the best
+    const entries = this.findAllWorkflowClasses();
+    if (entries.length === 0) { return null; }
 
+    let bestModel: WorkflowModel | null = null;
+    for (const entry of entries) {
+      const model = this.parseWorkflowClass(entry.name, entry.classBounds);
+      if (model && (!bestModel || model.nodes.length > bestModel.nodes.length)) {
+        bestModel = model;
+      }
+    }
+    return bestModel;
+  }
+
+  private findAllWorkflowClasses(): Array<{ name: string; classBounds: { start: number; end: number } }> {
+    const results: Array<{ name: string; classBounds: { start: number; end: number } }> = [];
+
+    for (let i = 0; i < this.lines.length; i++) {
+      const hasAttr = i > 0 && /\[Workflow\]/.test(this.lines[i - 1]);
+      const m = this.lines[i].match(/public\s+class\s+(\w+)/);
+      if (!m || (!hasAttr && !/[Ww]orkflow/.test(m[1]))) { continue; }
+
+      const bounds = this.findBraceFunctionBounds(/public\s+class\s+\w+/, i, this.lines.length);
+      if (bounds) {
+        results.push({ name: m[1], classBounds: bounds });
+        i = bounds.end;
+      }
+    }
+    if (results.length === 0) {
+      // Fallback
+      const hasAttr = /\[Workflow\]/.test(this.source);
+      const classMatch = this.source.match(/public\s+class\s+(\w+)/);
+      if (classMatch && (hasAttr || /[Ww]orkflow/.test(classMatch[1]))) {
+        results.push({ name: classMatch[1], classBounds: { start: 1, end: this.lines.length } });
+      }
+    }
+    return results;
+  }
+
+  private parseWorkflowClass(
+    name: string,
+    classBounds: { start: number; end: number }
+  ): WorkflowModel | null {
     const defaultOptions = this.parseActivityOptions();
 
-    // Find the [WorkflowRun] method body so we only pick up flow nodes inside it,
-    // not from private helper methods that may call Workflow.* primitives.
-    const wfMethodRange = this.findWorkflowRunRange();
+    const wfMethodRange = this.findWorkflowRunRange(classBounds);
 
     const tryCatchBlocks = this.findTryCatchBlocks(CS_TRY, CS_CATCH);
     const catchLines  = this.buildCatchLineSet(tryCatchBlocks);
@@ -30,6 +80,64 @@ export class DotNetParser extends BaseParser {
     /** Helper: true when a 1-based line is inside the workflow run method */
     const inWfMethod = (line: number) =>
       !wfMethodRange || (line >= wfMethodRange.start && line <= wfMethodRange.end);
+
+    // ── Helper function detection + inlining ──────────────────────────────
+    const helperRegions = wfMethodRange
+      ? this.collectHelperRegionsBrace(
+          wfMethodRange,
+          /(?:await\s+)?(?:this\.)?(\w+)\s*\(/,
+          CS_TEMPORAL_METHODS,
+          (methodName) => this.findCsMethodBounds(methodName, classBounds),
+        )
+      : [];
+
+    for (const hr of helperRegions) {
+      nodes.push({
+        id: this.toId('fn_' + hr.methodName, hr.callSiteLine),
+        label: hr.methodName + '()',
+        kind: 'functionCall',
+        role: 'flow',
+        line: hr.callSiteLine,
+      });
+    }
+
+    for (const hr of helperRegions) {
+      const helperNodes = this.scanHelperForPrimitives(hr.bounds, [
+        { pattern: /await\s+Workflow\.ExecuteActivityAsync\s*\(/, nodeFactory: (line) => {
+          const methodName = this.extractActivityMethodName(line);
+          return {
+            id: this.toId(methodName || 'activity', line),
+            label: (methodName || 'Activity').replace(/Async$/, ''),
+            kind: 'activity' as const, line,
+            options: defaultOptions ? { ...defaultOptions } : undefined,
+          };
+        } },
+        { pattern: /await\s+Workflow\.ExecuteLocalActivityAsync\s*\(/, nodeFactory: (line) => {
+          const methodName = this.extractActivityMethodName(line) || 'LocalActivity';
+          return {
+            id: this.toId('local_' + methodName, line),
+            label: methodName.replace(/Async$/, '') + ' (local)',
+            kind: 'activity' as const, line,
+          };
+        } },
+        { pattern: /await\s+Workflow\.DelayAsync\s*\(/, nodeFactory: (line) => ({
+          id: `delay_${line}`, label: 'DelayAsync', kind: 'timer' as const, line,
+        }) },
+        { pattern: /await\s+Workflow\.WaitConditionAsync\s*\(/, nodeFactory: (line) => ({
+          id: `wait_cond_${line}`, label: 'WaitConditionAsync', kind: 'condition' as const, line,
+        }) },
+        { pattern: /await\s+Workflow\.ExecuteChildWorkflowAsync\s*(?:<(\w+)>)?\s*\(/, nodeFactory: (line, match) => ({
+          id: this.toId('child_' + (match[1] || 'ChildWorkflow'), line),
+          label: (match[1] || 'ChildWorkflow') + ' (child)',
+          kind: 'childWorkflow' as const, line,
+        }) },
+        { pattern: /Workflow\.CreateContinueAsNewException\s*(?:<[^>]+>)?\s*\(/, nodeFactory: (line) => ({
+          id: `can_${line}`, label: 'ContinueAsNew', kind: 'sideEffect' as const, line,
+        }) },
+      ]);
+      this.applyVirtualLines(helperNodes, hr.callSiteLine);
+      nodes.push(...helperNodes);
+    }
 
     // ── Activity execution ─────────────────────────────────────────────────
 
@@ -71,7 +179,7 @@ export class DotNetParser extends BaseParser {
 
     // ── Query handlers ─────────────────────────────────────────────────────
 
-    this.findAllLines(/\[WorkflowQuery(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/).forEach(({ line, match }) => {
+    this.findAllLinesInBounds(/\[WorkflowQuery(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/, classBounds).forEach(({ line, match }) => {
       const qName = match[1] || this.getNextMethodName(line);
       if (qName) {
         nodes.push({ id: this.toId('query_' + qName), label: qName + ' (query)', kind: 'query', role: 'query-handler', line });
@@ -80,7 +188,7 @@ export class DotNetParser extends BaseParser {
 
     // ── Signal handlers ────────────────────────────────────────────────────
 
-    this.findAllLines(/\[WorkflowSignal(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/).forEach(({ line, match }) => {
+    this.findAllLinesInBounds(/\[WorkflowSignal(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/, classBounds).forEach(({ line, match }) => {
       const sName = match[1] || this.getNextMethodName(line);
       if (sName) {
         nodes.push({ id: this.toId('signal_' + sName), label: sName + ' (signal)', kind: 'signal', role: 'signal-handler', line });
@@ -89,7 +197,7 @@ export class DotNetParser extends BaseParser {
 
     // ── Update handlers ────────────────────────────────────────────────────
 
-    this.findAllLines(/\[WorkflowUpdate(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/).forEach(({ line, match }) => {
+    this.findAllLinesInBounds(/\[WorkflowUpdate(?:\s*\(\s*["']?(\w+)["']?\s*\))?\]/, classBounds).forEach(({ line, match }) => {
       const uName = match[1] || this.getNextMethodName(line);
       if (uName) {
         nodes.push({ id: this.toId('update_' + uName), label: uName + ' (update)', kind: 'signal', role: 'signal-handler', line });
@@ -187,10 +295,13 @@ export class DotNetParser extends BaseParser {
     });
 
     nodes.sort((a, b) => a.line - b.line);
-    // Loop anchor: only set when there is an actual infinite loop
-    // (`while(true)` / `for(;;)`) wrapping a WaitConditionAsync call.
     const loopAnchorId = this.detectInfiniteLoopAnchor(wfMethodRange, nodes);
     return { name, language: 'csharp', filePath: this.filePath, nodes, defaultOptions, loopAnchorId };
+  }
+
+  private findCsMethodBounds(name: string, classBounds: { start: number; end: number }): { start: number; end: number } | null {
+    const pat = new RegExp(`(?:private|protected|public|internal)\\s+(?:async\\s+)?\\S+\\s+${name}\\s*\\(`);
+    return this.findBraceFunctionBounds(pat, classBounds.start - 1, classBounds.end);
   }
 
   /**
@@ -238,8 +349,13 @@ export class DotNetParser extends BaseParser {
    * Find the 1-based line range of the [WorkflowRun] method body.
    * Returns null if not found (falls back to scanning the whole file).
    */
-  private findWorkflowRunRange(): { start: number; end: number } | null {
-    const annoIdx = this.lines.findIndex(l => /\[WorkflowRun\]/.test(l));
+  private findWorkflowRunRange(searchBounds?: { start: number; end: number }): { start: number; end: number } | null {
+    const searchStart = searchBounds ? searchBounds.start - 1 : 0;
+    const searchEnd = searchBounds ? Math.min(this.lines.length, searchBounds.end) : this.lines.length;
+    let annoIdx = -1;
+    for (let i = searchStart; i < searchEnd; i++) {
+      if (/\[WorkflowRun\]/.test(this.lines[i])) { annoIdx = i; break; }
+    }
     if (annoIdx < 0) { return null; }
 
     // Find the method signature after the annotation

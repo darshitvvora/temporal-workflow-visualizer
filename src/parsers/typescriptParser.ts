@@ -6,30 +6,74 @@ const TS_TRY     = /\btry\s*\{/;
 const TS_CATCH   = /\}\s*catch\s*\((?:\w+\s*:\s*([\w.]+)|\w+)\s*\)/;
 const TS_THROW   = /throw\s+new\s+(\w+(?:Error|Exception)?)\s*\(/;
 
+// Known Temporal/TS SDK and JS built-in names to exclude from helper detection
+const TS_TEMPORAL_METHODS = new Set([
+  'proxyActivities', 'proxyLocalActivities', 'sleep', 'condition',
+  'setHandler', 'defineSignal', 'defineQuery', 'defineUpdate',
+  'setDefaultSignalHandler', 'setDefaultQueryHandler', 'setDefaultUpdateHandler',
+  'executeChild', 'startChild', 'continueAsNew', 'makeContinueAsNewFunc',
+  'patched', 'deprecatePatch', 'uuid4', 'upsertMemo', 'upsertSearchAttributes',
+  'getExternalWorkflowHandle', 'createNexusClient',
+  // JS built-ins
+  'console', 'log', 'warn', 'error', 'info', 'debug', 'JSON', 'parse', 'stringify',
+  'Promise', 'all', 'allSettled', 'race', 'any', 'resolve', 'reject',
+  'setTimeout', 'clearTimeout', 'setInterval', 'Array', 'Object', 'Map', 'Set',
+  'push', 'pop', 'shift', 'unshift', 'splice', 'slice', 'filter', 'map', 'reduce',
+  'forEach', 'find', 'findIndex', 'some', 'every', 'includes', 'indexOf',
+  'keys', 'values', 'entries', 'from', 'of', 'isArray', 'assign', 'freeze',
+  'toString', 'valueOf', 'hasOwnProperty',
+]);
+
 export class TypeScriptParser extends BaseParser {
   parse(): WorkflowModel | null {
-    const wfMatch = this.source.match(/export\s+async\s+function\s+(\w+)\s*\(/);
-    if (!wfMatch) { return null; }
-    const name = wfMatch[1];
+    // Find ALL workflow functions, parse each, return the one with the most nodes
+    const entries = this.findAllWorkflowFunctions();
+    if (entries.length === 0) { return null; }
 
+    let bestModel: WorkflowModel | null = null;
+    for (const entry of entries) {
+      const model = this.parseWorkflowFunction(entry.name, entry.funcRange);
+      if (model && (!bestModel || model.nodes.length > bestModel.nodes.length)) {
+        bestModel = model;
+      }
+    }
+    return bestModel;
+  }
+
+  private findAllWorkflowFunctions(): Array<{ name: string; funcRange: { start: number; end: number } }> {
+    const results: Array<{ name: string; funcRange: { start: number; end: number } }> = [];
+    const pattern = /export\s+async\s+function\s+(\w+)\s*\(/;
+
+    for (let i = 0; i < this.lines.length; i++) {
+      const m = this.lines[i].match(pattern);
+      if (!m) { continue; }
+      const bounds = this.findBraceFunctionBounds(pattern, i, this.lines.length);
+      if (bounds) {
+        results.push({ name: m[1], funcRange: { start: i + 1, end: bounds.end } });
+        i = bounds.end;
+      }
+    }
+    return results.length > 0 ? results : (() => {
+      const wfMatch = this.source.match(pattern);
+      if (!wfMatch) { return []; }
+      return [{ name: wfMatch[1], funcRange: { start: 1, end: this.lines.length } }];
+    })();
+  }
+
+  private parseWorkflowFunction(
+    name: string,
+    wfRange: { start: number; end: number }
+  ): WorkflowModel | null {
     const { defaultOptions, activityNames, activitySet, proxyVarNames, localProxyVarNames } = this.parseProxyActivities();
 
-    // Build try/catch structure
     const tryCatchBlocks = this.findTryCatchBlocks(TS_TRY, TS_CATCH);
     const catchLines = this.buildCatchLineSet(tryCatchBlocks);
     const tryLineMap = this.buildTryLineMap(tryCatchBlocks);
 
-    // Determine function body bounds to limit node scanning to the workflow function
-    const funcHeaderLine = this.findLine(new RegExp(`export\\s+async\\s+function\\s+${name}\\s*\\(`));
-    let funcOpenLine = funcHeaderLine;
-    if (funcHeaderLine > 0) {
-      for (let k = funcHeaderLine - 1; k < Math.min(this.lines.length, funcHeaderLine + 10); k++) {
-        if (this.lines[k].includes('{')) { funcOpenLine = k + 1; break; }
-      }
-    }
+    const funcOpenLine = wfRange.start;
+    const funcEndLine = wfRange.end;
 
     // Helper: find the matching closing brace line (1-based) for the block
-    // that opens at or after `startLine` (1-based). Returns last line index.
     const findBlockEnd = (startLine: number): number => {
       let depth = 0;
       for (let i = startLine - 1; i < this.lines.length; i++) {
@@ -41,14 +85,79 @@ export class TypeScriptParser extends BaseParser {
       return this.lines.length;
     };
 
-    const funcEndLine = funcOpenLine ? findBlockEnd(funcOpenLine) : this.lines.length;
-
     /** Helper: true when a 1-based line is inside the workflow function body */
     const inWfFunc = (line: number) =>
-      !funcHeaderLine || (line >= funcOpenLine && line <= funcEndLine);
+      line >= funcOpenLine && line <= funcEndLine;
 
     let nodes: WorkflowNode[] = [];
     const seenLines = new Set<number>();
+
+    // ── Helper function detection + inlining ──────────────────────────────
+    const allExclude = new Set([...TS_TEMPORAL_METHODS, ...activityNames, ...proxyVarNames, ...localProxyVarNames]);
+    const helperRegions = this.collectHelperRegionsBrace(
+      wfRange,
+      /(?:await\s+)?(\w+)\s*\(/,
+      allExclude,
+      (methodName) => this.findTsFunctionBounds(methodName),
+    );
+
+    for (const hr of helperRegions) {
+      nodes.push({
+        id: this.toId('fn_' + hr.methodName, hr.callSiteLine),
+        label: hr.methodName + '()',
+        kind: 'functionCall',
+        role: 'flow',
+        line: hr.callSiteLine,
+      });
+    }
+
+    for (const hr of helperRegions) {
+      const helperNodes: WorkflowNode[] = [];
+      // Activities via destructured names
+      for (const actName of activityNames) {
+        this.findAllLinesInBounds(new RegExp(`await\\s+${actName}\\s*\\(`), hr.bounds).forEach(({ line }) => {
+          helperNodes.push({
+            id: this.toId(actName.replace(/Async$/, ''), line),
+            label: actName.replace(/Async$/, ''),
+            kind: 'activity', line,
+            options: defaultOptions ? { ...defaultOptions } : undefined,
+          });
+        });
+      }
+      // Activities via proxy var
+      for (const varName of [...proxyVarNames, ...localProxyVarNames]) {
+        const isLocal = localProxyVarNames.includes(varName);
+        this.findAllLinesInBounds(new RegExp(`await\\s+${varName}\\.(\\w+)\\s*\\(`), hr.bounds).forEach(({ line, match }) => {
+          const baseName = match[1].replace(/Async$/, '');
+          helperNodes.push({
+            id: this.toId(baseName, line),
+            label: baseName + (isLocal ? ' (local)' : ''),
+            kind: isLocal ? 'localActivity' : 'activity', line,
+            options: defaultOptions ? { ...defaultOptions } : undefined,
+          });
+        });
+      }
+      // Conditions, timers, child workflows, etc.
+      helperNodes.push(...this.scanHelperForPrimitives(hr.bounds, [
+        { pattern: /await\s+condition\s*\(/, nodeFactory: (line) => ({
+          id: `condition_${line}`, label: 'condition', kind: 'condition', line,
+        }) },
+        { pattern: /await\s+sleep\s*\(/, nodeFactory: (line) => ({
+          id: `sleep_${line}`, label: 'sleep', kind: 'timer', line,
+        }) },
+        { pattern: /executeChild\s*\(\s*(\w+)/, nodeFactory: (line, match) => ({
+          id: this.toId('child_' + match[1], line), label: match[1] + ' (child)', kind: 'childWorkflow', line,
+        }) },
+        { pattern: /startChild\s*\(\s*(\w+)/, nodeFactory: (line, match) => ({
+          id: this.toId('child_started_' + match[1], line), label: match[1] + ' (child, started)', kind: 'childWorkflow', line,
+        }) },
+        { pattern: /continueAsNew\s*(?:<[^>]+>)?\s*\(/, nodeFactory: (line) => ({
+          id: `can_${line}`, label: 'continueAsNew', kind: 'sideEffect', line,
+        }) },
+      ]));
+      this.applyVirtualLines(helperNodes, hr.callSiteLine);
+      nodes.push(...helperNodes);
+    }
 
     // Activity calls via destructured names: await chargeCard(...)
     for (const actName of activityNames) {
@@ -244,11 +353,20 @@ export class TypeScriptParser extends BaseParser {
     nodes = nodes.filter(n => !skippedNodeIds.has(n.id)).concat(newNodes);
     nodes.sort((a, b) => a.line - b.line);
 
-    // Loop anchor: only set when there is an actual infinite loop wrapping a
-    // condition/await (e.g. `while (true) { await condition(...) }`).
-    // A standalone `condition()` call is a one-time wait, NOT a loop.
     const loopAnchorId = this.detectInfiniteLoopAnchor(funcOpenLine, funcEndLine, nodes);
     return { name, language: 'typescript', filePath: this.filePath, nodes, defaultOptions, loopAnchorId, loopRegions: loopRegions.length ? loopRegions : undefined };
+  }
+
+  private findTsFunctionBounds(name: string): { start: number; end: number } | null {
+    const patterns = [
+      new RegExp(`(?:async\\s+)?function\\s+${name}\\s*[(<]`),
+      new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*(?:async\\s+)?(?:function|\\()`),
+    ];
+    for (const pat of patterns) {
+      const bounds = this.findBraceFunctionBounds(pat);
+      if (bounds) { return bounds; }
+    }
+    return null;
   }
 
   /**
