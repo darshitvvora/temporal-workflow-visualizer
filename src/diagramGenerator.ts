@@ -143,7 +143,11 @@ export function generateMermaid(model: WorkflowModel): string {
     lines.push('  end');
     lines.push('  class SIG signalGroup');
     lines.push('');
-    const sigTarget = model.loopAnchorId ?? 'START';
+    // Prefer signalTargetId (explicit hint from the parser for "this wait is
+    // what signals unblock") over loopAnchorId (which only applies to the
+    // agentic-loop pattern). Falls through to START when the workflow doesn't
+    // suspend on a wait_condition.
+    const sigTarget = model.signalTargetId ?? model.loopAnchorId ?? 'START';
     for (const sn of signalNodes) {
       lines.push(`  ${sn.id} -.->|"triggers"| ${sigTarget}`);
     }
@@ -224,14 +228,19 @@ function emitNode(ctx: EmitCtx, node: WorkflowNode, prev: string, skipLink = fal
     lines.push(`  ${joinId}[ ]:::startEnd`);
 
     for (const branch of node.branches) {
+      // An empty edgeLabel means "unlabeled arrow" (used for parallel-gather
+      // fan-out where the arms aren't conditional). Mermaid renders `|""|`
+      // as an empty label box, so we omit the segment entirely instead.
+      const arrow = branch.edgeLabel ? `-->|"${esc(branch.edgeLabel)}"|` : '-->';
+
       if (!branch.nodes || branch.nodes.length === 0) {
-        lines.push(`  ${id} -->|"${esc(branch.edgeLabel)}"| ${joinId}`);
+        lines.push(`  ${id} ${arrow} ${joinId}`);
         continue;
       }
 
       // Labeled edge to the first node, then emit the branch nodes
       const first = branch.nodes[0];
-      lines.push(`  ${id} -->|"${esc(branch.edgeLabel)}"| ${first.id}`);
+      lines.push(`  ${id} ${arrow} ${first.id}`);
       // Emit the first node but suppress duplicate prev->first link
       let branchPrev = emitNode(ctx, first, id, true);
       for (let i = 1; i < branch.nodes.length; i++) {

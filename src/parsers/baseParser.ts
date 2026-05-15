@@ -19,7 +19,15 @@ export abstract class BaseParser {
     this.lines = source.split('\n');
   }
 
-  abstract parse(): WorkflowModel | null;
+  /**
+   * Parse the source and return a WorkflowModel.
+   *
+   * The return type allows either a synchronous result (regex-based parsers)
+   * or a Promise (the AST-based Python parser, which needs to await tree-
+   * sitter WASM initialization on first use). Call sites must `await` the
+   * result to handle both uniformly.
+   */
+  abstract parse(): WorkflowModel | null | Promise<WorkflowModel | null>;
 
   /** Returns 1-based line number of first line matching the regex, or -1 */
   protected findLine(pattern: RegExp, startFrom = 0): number {

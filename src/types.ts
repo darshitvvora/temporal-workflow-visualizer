@@ -106,4 +106,15 @@ export interface WorkflowModel {
    * the line range of its body so the diagram generator can render the back-edge.
    */
   loopRegions?: LoopRegion[];
+  /**
+   * Node ID that signal/update handler "triggers" arrows should point at.
+   *
+   * Distinct from `loopAnchorId` because it controls only the destination of
+   * signal arrows, not the flow layout. Use case: a workflow does
+   * `await workflow.wait_condition(lambda: self._done)` once (no `while True:`).
+   * Signal handlers mutate `self._done`; arrows from handlers should point at
+   * the wait_condition, not at START. Without this hint the renderer can only
+   * guess via `loopAnchorId`, which also triggers the (incorrect) loop layout.
+   */
+  signalTargetId?: string;
 }
