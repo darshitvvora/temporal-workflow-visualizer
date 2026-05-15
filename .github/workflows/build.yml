@@ -1,0 +1,93 @@
+# Build, test, and package the VS Code extension.
+#
+#   - On every push to main and every PR targeting main:
+#       compile → test → package .vsix → upload as workflow artifact
+#   - On every push of a tag matching `v*` (e.g. v0.1.0):
+#       same pipeline, plus attach the .vsix to a GitHub Release
+#   - Manual `workflow_dispatch` lets you build any branch on demand
+#
+# The packaged .vsix is always uploaded as an artifact so you can grab a
+# build of any commit from the Actions tab without cutting a tag.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  # `contents: write` is needed to create the GitHub Release on tag pushes.
+  # All other steps work fine under the default read-only token.
+  contents: write
+
+jobs:
+  build:
+    name: Compile, test, package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # Caches ~/.npm based on package-lock.json — first run cold, every
+          # subsequent run reuses the same module store.
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        # Fast sanity check; `vsce package` re-invokes this via the
+        # `vscode:prepublish` script, but failing fast here makes the
+        # workflow easier to read when something goes wrong.
+        run: npm run compile
+
+      - name: Run Python parser tests
+        # Covers the AST stack: recognizer → CFG → WorkflowModel → Mermaid.
+        run: npm run test:python
+
+      - name: Package .vsix
+        # Outputs to dist/<name>-<version>.vsix per the `package` script's
+        # `--out dist/` flag in package.json.
+        run: npm run package
+
+      - name: Surface the produced .vsix in the run summary
+        run: |
+          echo "### Packaged artifact" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist/*.vsix; do
+            size=$(du -h "$f" | cut -f1)
+            echo "- \`$f\` ($size)" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload .vsix as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # SHA-tagged name so multiple runs don't collide and you can
+          # always trace an artifact back to its commit.
+          name: vsix-${{ github.sha }}
+          path: dist/*.vsix
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        # Only runs for tag pushes. PR builds and main-branch builds upload
+        # the artifact but don't publish a release.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.vsix
+          generate_release_notes: true
+          # `draft: false` would publish immediately; leaving as draft so
+          # the maintainer can review and edit the notes before pressing
+          # "Publish release". Flip to `false` once you trust the pipeline.
+          draft: true
+          fail_on_unmatched_files: true

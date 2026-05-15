@@ -1,10 +1,58 @@
+# What ends up in the .vsix is what's NOT matched here.
+#
+# vsce includes production dependencies by default. We override that for
+# bundle-size reasons: only the two runtime libraries the extension actually
+# loads at runtime get re-included via `!` patterns at the bottom.
+
+# ─── Source + dev tooling (not needed at runtime) ───────────────────────────
+src/**
+test/**
+scripts/**
+demo_video/**
+dist/**
 .vscode/**
 .vscode-test/**
-src/**
+.github/**
+.claude/**
 .gitignore
+.gitattributes
 .eslintrc.json
 tsconfig.json
+tsconfig.test.json
+**/tsconfig.tsbuildinfo
+
+# Source maps + raw TS in any nested folder
 **/*.map
 **/*.ts
-!out/**
+
+# Test compile leftovers — `npm run test:python` writes to out/src/ and
+# out/test/ because tsconfig.test.json uses rootDir "./", which overlaps
+# with the main compile's output layout. Strip them defensively here so a
+# stale local build doesn't bloat the .vsix.
+out/src/**
+out/test/**
+
+# Built .vsix bundles (we don't ship the bundle inside the bundle)
+*.vsix
+
+# ─── Dependency pruning ─────────────────────────────────────────────────────
+# Block everything under node_modules, then selectively re-include only what
+# the extension host needs at runtime. Mermaid is loaded from CDN inside the
+# webview, so the npm package isn't needed in the .vsix.
 node_modules/**
+
+# web-tree-sitter: required by src/parsers/python/astHelpers.ts at runtime.
+# We need the CJS entry, its .wasm, and package.json so `require()` resolves.
+!node_modules/web-tree-sitter/web-tree-sitter.cjs
+!node_modules/web-tree-sitter/web-tree-sitter.d.ts
+!node_modules/web-tree-sitter/web-tree-sitter.js
+!node_modules/web-tree-sitter/web-tree-sitter.wasm
+!node_modules/web-tree-sitter/package.json
+!node_modules/web-tree-sitter/LICENSE
+
+# @vscode/tree-sitter-wasm bundles ~15 grammars (~22 MB). The extension only
+# loads Python today, so ship only that grammar. When other-language parsers
+# are ported to tree-sitter, add their grammars here one at a time.
+!node_modules/@vscode/tree-sitter-wasm/package.json
+!node_modules/@vscode/tree-sitter-wasm/LICENSE
+!node_modules/@vscode/tree-sitter-wasm/wasm/tree-sitter-python.wasm

@@ -3,7 +3,11 @@
   "displayName": "Temporal Workflow Visualizer",
   "description": "Visualize Temporal workflows as interactive Mermaid flowcharts with click-to-navigate",
   "version": "0.1.0",
-  "publisher": "Darshit Vora",
+  "publisher": "darshitvvora",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/darshitvvora/temporal-workflow-visualizer.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -53,7 +57,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package",
+    "package": "vsce package --out dist/",
     "test:python": "tsc -p tsconfig.test.json && node out/test/python/recognizer.smoke.js && node out/test/python/cfg.smoke.js && node out/test/python/parser.smoke.js && node out/test/python/mermaid.smoke.js"
   },
   "devDependencies": {

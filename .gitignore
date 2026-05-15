@@ -1,3 +1,6 @@
 node_modules/
 out/
+# Built .vsix bundles — produced by `npm run package` into dist/.
+# We keep the dist/ folder via dist/.gitkeep so the path exists.
 *.vsix
+dist/*.vsix
